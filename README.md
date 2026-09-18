@@ -50,3 +50,40 @@ curl 'localhost:8335/v1/chat/completions?model=llama3.1' \
 - `src/main.rs` — CLI + Axum server
 - `src/discovery.rs` — port / process / docker scan + `/v1/models` probe
 - `src/hive.rs` — aggregation, routing, load-balancing, proxy
+- `src/logging.rs` — query log entries + `LogSink` trait
+
+## Query logging
+
+Every proxied query (chat / completions / embeddings — successes,
+streaming requests, and routing failures) is appended to
+`hivllm-queries.jsonl` (JSON lines) unless `--log-file ""` is passed:
+
+```bash
+cargo run -- --log-file queries.jsonl --log-format jsonl
+```
+
+Inspect with `jq`:
+
+```bash
+jq -c '{ts, route, model, upstream, status, latency_ms}' hivllm-queries.jsonl
+jq -s 'group_by(.model) | map({model: .[0].model, n: length})' hivllm-queries.jsonl
+# read back full responses (content + reasoning kept separate):
+jq -c '{model, response: {content, reasoning, tool_calls}}' hivllm-queries.jsonl
+```
+
+Each entry carries the full client `request` and the full upstream
+`response` by default: `response.content` and `response.reasoning` in
+separate fields, merged `response.tool_calls`, plus the raw payload
+(`response.raw`, absent for streams — those store the assembled text and
+a `chunks` count instead). Tool *results* (role `"tool"`) travel in later
+client requests, already logged in full under `request`.
+
+Cap log size with a truncation strategy:
+
+```bash
+cargo run -- --log-truncate chars --log-max-chars 500
+```
+
+Adding a sink (YAML file, Langfuse, Logfire, …) means implementing the
+`LogSink` trait in `src/logging.rs` and wiring it in `main.rs` —
+the proxy code doesn't change.

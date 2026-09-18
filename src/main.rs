@@ -12,16 +12,26 @@
 
 mod discovery;
 mod hive;
+mod logging;
 
 use axum::{
     routing::{get, post},
     Router,
 };
-use clap::Parser;
-use std::{net::SocketAddr, time::Duration};
+use clap::{Parser, ValueEnum};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use hive::Hive;
+use logging::{JsonLinesSink, RequestLogger};
+
+/// Query-log output format. Only `jsonl` is implemented today —
+/// `yaml` (and Langfuse/Logfire API sinks) plug into the same
+/// `LogSink` trait (see `src/logging.rs`).
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum LogFormat {
+    Jsonl,
+}
 
 #[derive(Parser, Debug)]
 #[command(name = "hivllm", about = "All your models. One sticky hive. 🐝")]
@@ -37,6 +47,22 @@ struct Args {
     /// Re-scan interval in seconds (0 = scan once at startup)
     #[arg(long, default_value_t = 30)]
     scan_interval: u64,
+
+    /// Query log file (one entry per line). Empty = no query logging.
+    #[arg(long, default_value = "hivllm-queries.jsonl")]
+    log_file: String,
+
+    /// Query log format
+    #[arg(long, value_enum, default_value_t = LogFormat::Jsonl)]
+    log_format: LogFormat,
+
+    /// Truncation strategy for long text in query logs (requests + responses)
+    #[arg(long, value_enum, default_value_t = logging::Truncate::None)]
+    log_truncate: logging::Truncate,
+
+    /// Max chars per text field when --log-truncate chars
+    #[arg(long, default_value_t = 2000)]
+    log_max_chars: usize,
 }
 
 #[tokio::main]
@@ -49,7 +75,19 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let args = Args::parse();
-    let hive = Hive::new(args.port);
+
+    let logger = if args.log_file.is_empty() {
+        RequestLogger::new()
+    } else {
+        let sink: Arc<dyn logging::LogSink> = match args.log_format {
+            LogFormat::Jsonl => Arc::new(JsonLinesSink::open(&args.log_file).await?),
+        };
+        tracing::info!(file = %args.log_file, "🐝 query log enabled");
+        RequestLogger::new().with_sink(sink)
+    };
+    let hive = Hive::new(args.port)
+        .with_logger(logger)
+        .with_log_options(args.log_truncate, args.log_max_chars);
 
     // Initial discovery before serving.
     hive.refresh(&args.extra_ports).await;
