@@ -6,12 +6,14 @@
 //!
 //! - `GET /v1/models` — aggregated model list
 //! - `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` —
-//!   routed by `model`
+//!   routed by `model` to the least-loaded backend
 //!   (JSON body field, `?model=` query param wins as override).
-//!   Same model name on several endpoints => round-robin load-balancing.
+//!   Ties and backends without load info round-robin; unreachable
+//!   backends fail over to the next candidate.
 
 mod discovery;
 mod hive;
+mod load;
 mod logging;
 
 use axum::{
@@ -47,6 +49,11 @@ struct Args {
     /// Re-scan interval in seconds (0 = scan once at startup)
     #[arg(long, default_value_t = 30)]
     scan_interval: u64,
+
+    /// Backend load poll interval in seconds for least-load routing
+    /// (0 = disable polling, fall back to plain round-robin)
+    #[arg(long, default_value_t = 5)]
+    load_interval: u64,
 
     /// Query log file (one entry per line). Empty = no query logging.
     #[arg(long, default_value = "hivllm-queries.jsonl")]
@@ -91,6 +98,19 @@ async fn main() -> anyhow::Result<()> {
 
     // Initial discovery before serving.
     hive.refresh(&args.extra_ports).await;
+
+    // Prime load state so the first requests are already load-informed.
+    if args.load_interval > 0 {
+        hive.refresh_load().await;
+        let hive_bg = hive.clone();
+        let interval = args.load_interval;
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(interval)).await;
+                hive_bg.refresh_load().await;
+            }
+        });
+    }
 
     // Background re-scan loop.
     if args.scan_interval > 0 {

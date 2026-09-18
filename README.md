@@ -12,12 +12,19 @@ and gathers them behind a **single endpoint**.
      and probes each for `/v1/models`.
    - Re-scans every `--scan-interval` seconds (default 30).
 
-2. **Unified hive** (`src/hive.rs`)
+2. **Unified hive** (`src/hive.rs`, `src/load.rs`)
    - `GET /v1/models` → aggregated model list from all members.
    - `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` →
      routed by `model`
      (JSON body field; `?model=` query param wins as override).
-   - Same model name on several endpoints → **round-robin load-balancing**.
+   - **Load-aware routing**: backends are polled (`--load-interval`, default
+     5s) via provider probes — vLLM `GET /load` today (needs
+     `--enable-server-load-tracking` server-side; without it the backend
+     simply reports unknown) — and requests go to the lowest `server_load`
+     (tracked requests, not GPU util). Ties and unknown-load backends
+     round-robin; no load info at all degrades to plain round-robin.
+   - Unreachable backends fail over to the next candidate instead of
+     failing the request.
    - Streaming (`"stream": true`) SSE is passed through.
 
 3. **Ops**
