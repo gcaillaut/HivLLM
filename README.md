@@ -57,7 +57,40 @@ default `"*"`, empty disables).
 cargo run --  # serves on :8335 (BEES 🐝) by default
 # with extra ports + faster rescan:
 cargo run -- --extra-ports 9000,8081 --scan-interval 10
+# pin backends discovery can't see (docker service names, remote hosts):
+cargo run -- --static-backends http://llamacpp:8080,http://gpu-box:8000
+# expose beyond localhost (containers, LAN):
+cargo run -- --bind 0.0.0.0
 ```
+
+## Docker (`docker/`)
+
+```bash
+docker build -f docker/Dockerfile -t hivllm .
+docker run --rm --network host hivllm
+# persist the query log + custom flags:
+docker run --rm --network host -v hivllm-logs:/data hivllm \
+  --log-file /data/hivllm-queries.jsonl --port 8335
+# or via compose:
+docker compose -f docker/docker-compose.yml up --build
+```
+
+Notes:
+- `--network host` (Linux) is the zero-config path: discovery probes localhost,
+  which sees host backends in the host's network namespace.
+- For bridge networks (siblings like `http://llamacpp:8080`), combine
+  `--bind 0.0.0.0` (the hive binds `127.0.0.1` by default, unreachable through
+  published ports otherwise) with `--static-backends http://llamacpp:8080` —
+  static entries are probed for `/v1/models` on every rescan, flow through
+  routing, load probes and logging like discovered ones, and rejoin
+  automatically after flapping. Unreachable entries are skipped with a warning.
+- macOS/Windows have no host net — run the binary directly there instead.
+- Containerized discovery covers well-known ports + `ss` listeners (`docker ps`
+  scanning stays host-side). Process names aren't visible across the container
+  boundary, so members show as `port-XXXX` instead.
+- Runs as unprivileged user: stick to ports > 1024. The image carries a
+  `HEALTHCHECK` on `:8335/health` (override it when serving another `--port`).
+- Image is ~110MB (multi-stage `rust:1-bookworm` → `debian:bookworm-slim`).
 
 Then:
 

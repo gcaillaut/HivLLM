@@ -1,0 +1,4 @@
+# Keep the build context small (the Dockerfile lives in docker/).
+/target
+/.git
+hivllm-queries.jsonl

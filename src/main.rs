@@ -12,6 +12,7 @@
 //!   backends fail over to the next candidate.
 
 mod discovery;
+mod docker;
 mod hive;
 mod load;
 mod logging;
@@ -21,7 +22,11 @@ use axum::{
     Router,
 };
 use clap::{Parser, ValueEnum};
-use std::{net::SocketAddr, sync::Arc, time::Duration};
+use std::{
+    net::{IpAddr, SocketAddr},
+    sync::Arc,
+    time::Duration,
+};
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use hive::Hive;
@@ -42,9 +47,27 @@ struct Args {
     #[arg(long, default_value_t = 8335)]
     port: u16,
 
+    /// Interface to bind (127.0.0.1 keeps the hive local; 0.0.0.0 exposes
+    /// it, e.g. from a container with published ports)
+    #[arg(long, default_value = "127.0.0.1")]
+    bind: IpAddr,
+
     /// Extra localhost ports to probe (in addition to well-known ones)
     #[arg(long, value_delimiter = ',')]
     extra_ports: Vec<u16>,
+
+    /// Static backends discovery can't see: base URLs probed for
+    /// `/v1/models` on every rescan (docker service names like
+    /// `http://llamacpp:8080`, remote hosts, …). Comma-separated and/or
+    /// repeatable. Unreachable entries are skipped until they answer.
+    #[arg(long, value_delimiter = ',')]
+    static_backends: Vec<String>,
+
+    /// Docker Engine socket for container auto-discovery
+    /// (`-v /var/run/docker.sock:/var/run/docker.sock` + opt-in labels
+    /// `hivllm.enable=true`, `hivllm.port=8080`). Empty = disabled.
+    #[arg(long, default_value = "")]
+    docker_socket: String,
 
     /// Re-scan interval in seconds (0 = scan once at startup)
     #[arg(long, default_value_t = 30)]
@@ -100,8 +123,27 @@ async fn main() -> anyhow::Result<()> {
         .with_logger(logger)
         .with_log_options(args.log_truncate, args.log_max_chars);
 
+    // Docker socket discovery (opt-in): containers labeled
+    // `hivllm.enable=true` join the hive; lifecycle events refresh it.
+    let docker = if args.docker_socket.is_empty() {
+        None
+    } else {
+        match docker::DockerDiscovery::connect(&args.docker_socket).await {
+            Ok(d) => {
+                tracing::info!(socket = %args.docker_socket, "🐝 docker discovery enabled");
+                Some(d)
+            }
+            Err(e) => {
+                tracing::warn!(error = %e, "docker socket unreachable (mount it with -v and match its group, e.g. --group-add $(stat -c %g /var/run/docker.sock)), continuing without it");
+                None
+            }
+        }
+    };
+
     // Initial discovery before serving.
-    hive.refresh(&args.extra_ports).await;
+    hive
+        .refresh(&args.extra_ports, &args.static_backends, docker.as_ref())
+        .await;
 
     // Prime load state so the first requests are already load-informed.
     // The load refresh announces the hive view; without polling, the
@@ -124,13 +166,25 @@ async fn main() -> anyhow::Result<()> {
     if args.scan_interval > 0 {
         let hive_bg = hive.clone();
         let extra = args.extra_ports.clone();
+        let pinned = args.static_backends.clone();
+        let dock = docker.clone();
         let interval = args.scan_interval;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
-                hive_bg.refresh(&extra).await;
+                hive_bg.refresh(&extra, &pinned, dock.as_ref()).await;
                 hive_bg.log_view().await;
             }
+        });
+    }
+
+    // Docker lifecycle watcher: instant refresh on container changes.
+    if let Some(d) = docker {
+        let hive_bg = hive.clone();
+        let extra = args.extra_ports.clone();
+        let pinned = args.static_backends.clone();
+        tokio::spawn(async move {
+            d.watch_events(hive_bg, extra, pinned).await;
         });
     }
 
@@ -169,7 +223,7 @@ async fn main() -> anyhow::Result<()> {
         app = app.layer(layer);
     }
 
-    let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
+    let addr = SocketAddr::from((args.bind, args.port));
     tracing::info!("🐝 HivLLM hive listening on http://{addr}");
     tracing::info!("   GET  /v1/models");
     tracing::info!("   POST /v1/chat/completions  (route by `model`)");

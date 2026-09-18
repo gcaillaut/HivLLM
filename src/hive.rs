@@ -21,7 +21,8 @@ use std::{
 };
 use tokio::sync::{oneshot, Mutex, RwLock};
 
-use crate::discovery::{discover, DiscoveredEndpoint};
+use crate::discovery::{discover, merge_endpoints, probe_static, DiscoveredEndpoint};
+use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
 use crate::logging::{
     extract_response, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
@@ -112,9 +113,20 @@ impl Hive {
         self.logger.log(entry).await;
     }
 
-    pub async fn refresh(&self, extra_ports: &[u16]) {
+    pub async fn refresh(
+        &self,
+        extra_ports: &[u16],
+        static_backends: &[String],
+        docker: Option<&DockerDiscovery>,
+    ) {
         let found = discover(&self.client, extra_ports, &[self.own_port]).await;
-        *self.endpoints.write().await = found;
+        let pinned = probe_static(&self.client, static_backends).await;
+        let mut all = merge_endpoints(found, pinned);
+        if let Some(d) = docker {
+            let docked = d.container_backends(&self.client).await;
+            all = merge_endpoints(all, docked);
+        }
+        *self.endpoints.write().await = all;
     }
 
     pub async fn snapshot(&self) -> Vec<DiscoveredEndpoint> {

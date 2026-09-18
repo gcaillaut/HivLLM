@@ -230,6 +230,103 @@ pub async fn discover(
     endpoints
 }
 
+/// Normalize an operator-provided backend URL: default to `http://` when no
+/// scheme is given, strip trailing slashes.
+pub fn normalize_base_url(raw: &str) -> String {
+    let with_scheme = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    with_scheme.trim_end_matches('/').to_string()
+}
+
+/// Host part of a base URL, for ids and display names.
+fn url_host(base_url: &str) -> String {
+    let no_scheme = base_url.split("://").last().unwrap_or(base_url);
+    no_scheme
+        .split('/')
+        .next()
+        .unwrap_or(no_scheme)
+        .to_string()
+}
+
+/// Probe operator-provided backends (docker service names, remote hosts,
+/// anything discovery can't see). Unreachable entries are skipped with a
+/// warning — never added half-dead. Re-run every refresh so flapping
+/// backends rejoin automatically.
+pub async fn probe_static(
+    client: &reqwest::Client,
+    urls: &[String],
+) -> Vec<DiscoveredEndpoint> {
+    let probed: Vec<Option<DiscoveredEndpoint>> = stream::iter(urls.iter().cloned())
+        .map(|raw| {
+            let client = client.clone();
+            async move {
+                let base_url = normalize_base_url(&raw);
+                let models = match probe_openai_endpoint(&client, &base_url).await {
+                    Some(m) => m,
+                    None => {
+                        tracing::warn!(%base_url, "static backend unreachable, skipping");
+                        return None;
+                    }
+                };
+                let host = url_host(&base_url);
+                let id: String = format!(
+                    "static-{}",
+                    base_url
+                        .chars()
+                        .map(|c| if c.is_alphanumeric() { c } else { '-' })
+                        .collect::<String>()
+                );
+                Some(DiscoveredEndpoint {
+                    id,
+                    name: host,
+                    base_url,
+                    models,
+                    source: "static".to_string(),
+                })
+            }
+        })
+        .buffer_unordered(16)
+        .collect()
+        .await;
+    let mut endpoints: Vec<DiscoveredEndpoint> = probed.into_iter().flatten().collect();
+    endpoints.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+    endpoints
+}
+
+/// Merge discovered + static endpoints, deduplicated by `base_url` with
+/// unioned model lists. A static entry marks the merged source `static`
+/// (operator intent wins the label).
+pub fn merge_endpoints(
+    discovered: Vec<DiscoveredEndpoint>,
+    statik: Vec<DiscoveredEndpoint>,
+) -> Vec<DiscoveredEndpoint> {
+    let mut by_url: HashMap<String, DiscoveredEndpoint> = HashMap::new();
+    for ep in discovered.into_iter().chain(statik) {
+        match by_url.get_mut(&ep.base_url) {
+            Some(existing) => {
+                for m in &ep.models {
+                    if !existing.models.contains(m) {
+                        existing.models.push(m.clone());
+                    }
+                }
+                existing.models.sort();
+                if ep.source == "static" {
+                    existing.source = "static".to_string();
+                }
+            }
+            None => {
+                by_url.insert(ep.base_url.clone(), ep);
+            }
+        }
+    }
+    let mut out: Vec<DiscoveredEndpoint> = by_url.into_values().collect();
+    out.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -249,5 +346,77 @@ mod tests {
         assert!(ports.contains(&11434));
         assert!(ports.contains(&1234));
         assert!(ports.contains(&9999));
+    }
+
+    #[test]
+    fn normalizes_static_urls() {
+        assert_eq!(
+            normalize_base_url("http://llamacpp:8080/"),
+            "http://llamacpp:8080"
+        );
+        assert_eq!(normalize_base_url("llamacpp:8080"), "http://llamacpp:8080");
+        assert_eq!(normalize_base_url("https://h:1/a/"), "https://h:1/a");
+    }
+
+    #[test]
+    fn merges_by_base_url_with_model_union() {
+        fn ep(url: &str, models: &[&str], source: &str) -> DiscoveredEndpoint {
+            DiscoveredEndpoint {
+                id: format!("{source}-{url}"),
+                name: "test".into(),
+                base_url: url.into(),
+                models: models.iter().map(|s| s.to_string()).collect(),
+                source: source.into(),
+            }
+        }
+        let out = merge_endpoints(
+            vec![ep("http://127.0.0.1:11434", &["a"], "ss-listener")],
+            vec![
+                ep("http://127.0.0.1:11434", &["b"], "static"),
+                ep("http://llamacpp:8080", &["c"], "static"),
+            ],
+        );
+        assert_eq!(out.len(), 2);
+        let local = out.iter().find(|e| e.base_url.contains("11434")).unwrap();
+        assert_eq!(local.models, vec!["a".to_string(), "b".to_string()]);
+        assert_eq!(local.source, "static");
+    }
+
+    #[tokio::test]
+    async fn static_probe_skips_unreachable() {
+        // Live mock backend.
+        let app = axum::Router::new().route(
+            "/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{"id": "demo-model", "object": "model"}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // Dead port: reserve then release.
+        let tmp = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let dead = tmp.local_addr().unwrap().port();
+        drop(tmp);
+
+        let client = reqwest::Client::new();
+        let found = probe_static(
+            &client,
+            &[
+                format!("http://127.0.0.1:{port}"),
+                format!("127.0.0.1:{dead}"),
+            ],
+        )
+        .await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].models, vec!["demo-model".to_string()]);
+        assert_eq!(found[0].source, "static");
     }
 }

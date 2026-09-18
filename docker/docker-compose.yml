@@ -1,0 +1,27 @@
+# HivLLM via Docker Compose.
+#
+# Usage from the repo root:
+#   docker compose -f docker/docker-compose.yml up --build [-d]
+#   docker compose -f docker/docker-compose.yml logs -f hive
+#
+# NOTE: host networking is REQUIRED (Linux): the hive discovers backends by
+# probing localhost, which only works in the host's network namespace.
+# This does not work with bridge networking, nor on macOS/Windows (Docker
+# Desktop has no host net) — run the binary directly there instead.
+name: hivllm
+
+services:
+  hive:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile
+    image: hivllm:latest
+    network_mode: host
+    restart: unless-stopped
+    volumes:
+      - query-logs:/data
+    # Persist the query log outside the container's writable layer.
+    command: ["--log-file", "/data/hivllm-queries.jsonl"]
+
+volumes:
+  query-logs:
