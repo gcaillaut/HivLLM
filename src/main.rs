@@ -89,7 +89,7 @@ async fn main() -> anyhow::Result<()> {
         let sink: Arc<dyn logging::LogSink> = match args.log_format {
             LogFormat::Jsonl => Arc::new(JsonLinesSink::open(&args.log_file).await?),
         };
-        tracing::info!(file = %args.log_file, "🐝 query log enabled");
+        tracing::info!(file = %args.log_file, sink = sink.name(), "🐝 query log enabled");
         RequestLogger::new().with_sink(sink)
     };
     let hive = Hive::new(args.port)
@@ -100,6 +100,8 @@ async fn main() -> anyhow::Result<()> {
     hive.refresh(&args.extra_ports).await;
 
     // Prime load state so the first requests are already load-informed.
+    // The load refresh announces the hive view; without polling, the
+    // discovery refresh announces it instead — either way, exactly once.
     if args.load_interval > 0 {
         hive.refresh_load().await;
         let hive_bg = hive.clone();
@@ -110,6 +112,8 @@ async fn main() -> anyhow::Result<()> {
                 hive_bg.refresh_load().await;
             }
         });
+    } else {
+        hive.log_view().await;
     }
 
     // Background re-scan loop.
@@ -121,12 +125,14 @@ async fn main() -> anyhow::Result<()> {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
                 hive_bg.refresh(&extra).await;
+                hive_bg.log_view().await;
             }
         });
     }
 
     let app = Router::new()
         .route("/health", get(hive::health))
+        .route("/load", get(hive::server_load))
         .route("/v1/models", get(hive::list_models))
         .route("/v1/chat/completions", post(hive::chat_completions))
         .route("/v1/completions", post(hive::completions))

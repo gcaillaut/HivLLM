@@ -17,14 +17,28 @@ and gathers them behind a **single endpoint**.
    - `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` →
      routed by `model`
      (JSON body field; `?model=` query param wins as override).
-   - **Load-aware routing**: backends are polled (`--load-interval`, default
-     5s) via provider probes — vLLM `GET /load` today (needs
-     `--enable-server-load-tracking` server-side; without it the backend
-     simply reports unknown) — and requests go to the lowest `server_load`
-     (tracked requests, not GPU util). Ties and unknown-load backends
-     round-robin; no load info at all degrades to plain round-robin.
-   - Unreachable backends fail over to the next candidate instead of
-     failing the request.
+    - **Load-aware routing**: backends are polled (`--load-interval`, default
+      5s) via provider probes — vLLM `GET /metrics`
+      (`num_requests_running` + `num_requests_waiting`, always exported)
+      first, `GET /load` as fallback (only truthful with
+      `--enable-server-load-tracking` server-side) — and requests go to
+      the lowest *effective* load: `max(server_load, hive-observed
+      in-flight requests)`. Ties round-robin; unreachable
+      backends fail over to the next candidate.
+    - Stdout shows the same numbers the balancer uses, per model:
+      positive server reports as `load=N`, anything unverified as
+      `load=~N` (unknown backends, or a `0` that could equally mean idle
+      or untracked). Backends ordered by decreasing load.
+   - `GET /load[?model=]` reports the hive's own aggregate pressure
+     (median of member effective loads, exact reports only) with marker
+     `"hivllm": {"exact": bool}` so upstream hives route on real numbers —
+     per model when `?model=` is given, global otherwise. Unverified
+     aggregates are marked inexact and never trusted downstream, so a
+     stale number can't circulate hive-to-hive as fact (approximations
+     are always recomputed locally, never forwarded as exact). Forwarded requests
+     carry an `x-hivllm-via` path and are never sent back to a visited
+     hive — mutual preferences can't ping-pong forever (answer is 502
+     `loop detected` instead).
    - Streaming (`"stream": true`) SSE is passed through.
 
 3. **Ops**
