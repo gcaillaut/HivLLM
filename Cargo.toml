@@ -1,0 +1,22 @@
+[package]
+name = "hivllm"
+version = "0.1.0"
+edition = "2021"
+description = "All your models. One sticky hive. 🐝 — auto-discover local OpenAI endpoints and serve them as one."
+license = "MIT"
+
+[[bin]]
+name = "hivllm"
+path = "src/main.rs"
+
+[dependencies]
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+reqwest = { version = "0.12", features = ["json", "stream"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive"] }
+futures = "0.3"
+bytes = "1"
