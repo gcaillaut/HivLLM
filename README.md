@@ -44,6 +44,12 @@ and gathers them behind a **single endpoint**.
 3. **Ops**
    - `GET /health`
    - `GET /api/hive/endpoints` → discovered members + their models.
+   - `GET /api/hive/backends` → per-model backends with the loads the
+     balancer routes on (`{models: [{id, backends: [{ip, port, load, exact}]}]}`).
+   - `GET /api/hive/queries?limit=100` → last query-log entries, newest first.
+
+Browser UIs talk to the hive with CORS enabled by default (`--cors-origin`,
+default `"*"`, empty disables).
 
 ## Run
 

@@ -70,6 +70,10 @@ struct Args {
     /// Max chars per text field when --log-truncate chars
     #[arg(long, default_value_t = 2000)]
     log_max_chars: usize,
+
+    /// CORS allowed origin for browser UIs ("*" = any; empty = disabled)
+    #[arg(long, default_value = "*")]
+    cors_origin: String,
 }
 
 #[tokio::main]
@@ -130,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(hive::health))
         .route("/load", get(hive::server_load))
         .route("/v1/models", get(hive::list_models))
@@ -138,7 +142,32 @@ async fn main() -> anyhow::Result<()> {
         .route("/v1/completions", post(hive::completions))
         .route("/v1/embeddings", post(hive::embeddings))
         .route("/api/hive/endpoints", get(hive::list_endpoints))
+        .route("/api/hive/backends", get(hive::list_backends))
+        .route("/api/hive/queries", get(hive::list_queries))
         .with_state(hive);
+
+    // Browser UIs (HiveChat) need CORS; CLI/curl don't care.
+    if !args.cors_origin.is_empty() {
+        use tower_http::cors::{Any, CorsLayer};
+        let layer = if args.cors_origin == "*" {
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any)
+        } else {
+            match args.cors_origin.parse::<axum::http::HeaderValue>() {
+                Ok(origin) => CorsLayer::new()
+                    .allow_origin(origin)
+                    .allow_methods(Any)
+                    .allow_headers(Any),
+                Err(e) => {
+                    tracing::warn!(%e, "invalid --cors-origin, CORS disabled");
+                    CorsLayer::new()
+                }
+            }
+        };
+        app = app.layer(layer);
+    }
 
     let addr = SocketAddr::from(([127, 0, 0, 1], args.port));
     tracing::info!("🐝 HivLLM hive listening on http://{addr}");

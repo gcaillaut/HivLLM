@@ -21,3 +21,4 @@ clap = { version = "4", features = ["derive"] }
 futures = "0.3"
 bytes = "1"
 chrono = { version = "0.4", features = ["serde", "clock"] }
+tower-http = { version = "0.6", features = ["cors"] }

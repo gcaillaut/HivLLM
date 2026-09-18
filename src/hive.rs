@@ -235,26 +235,26 @@ impl Hive {
         }
     }
 
-    /// Split `http://127.0.0.1:9037` into `("127.0.0.1", "9037")`.
-    fn split_host_port(base_url: &str) -> (String, String) {
+    /// Split `http://127.0.0.1:9037` into `("127.0.0.1", Some(9037))`.
+    fn split_host_port(base_url: &str) -> (String, Option<u16>) {
         let no_scheme = base_url.split("://").last().unwrap_or(base_url);
         match no_scheme.rfind(':') {
-            Some(i) => (no_scheme[..i].to_string(), no_scheme[i + 1..].to_string()),
-            None => (no_scheme.to_string(), "?".to_string()),
+            Some(i) => (
+                no_scheme[..i].to_string(),
+                no_scheme[i + 1..].parse().ok(),
+            ),
+            None => (no_scheme.to_string(), None),
         }
     }
 
-    /// Render the per-model hive view: for each model, every backend with
-    /// ip, port and the SAME effective load the balancer routes on —
-    /// tracked `server_load`, or `~N` hive-observed in-flight requests
-    /// when the server report doesn't cover them (no tracking, stuck at
-    /// 0, …). Backends ordered by decreasing load.
-    async fn render_view(&self) -> String {
+    /// Per-model backends with the SAME effective loads the balancer routes
+    /// on. Backs both the stdout view and `GET /api/hive/backends`.
+    pub async fn backends_view(&self) -> BackendsView {
         let endpoints = self.endpoints.read().await;
         let loads = self.loads.read().await;
         let inflight = self.inflight.lock().await;
-        // model -> rows of (addr, effective load, exact?)
-        let mut models: HashMap<String, Vec<(String, u64, bool)>> = HashMap::new();
+        // model -> rows
+        let mut models: HashMap<String, Vec<BackendInfo>> = HashMap::new();
         for ep in endpoints.iter() {
             for m in &ep.models {
                 let server = loads
@@ -264,10 +264,12 @@ impl Hive {
                 let flying = inflight.get(&ep.base_url).copied().unwrap_or(0);
                 let (num, exact) = effective_load(server, flying);
                 let (ip, port) = Self::split_host_port(&ep.base_url);
-                models
-                    .entry(m.clone())
-                    .or_default()
-                    .push((format!("{ip}:{port}"), num, exact));
+                models.entry(m.clone()).or_default().push(BackendInfo {
+                    ip,
+                    port,
+                    load: num,
+                    exact,
+                });
             }
         }
         drop(inflight);
@@ -275,25 +277,67 @@ impl Hive {
         drop(endpoints);
         let mut names: Vec<String> = models.keys().cloned().collect();
         names.sort_unstable();
-        let n_backends: usize = models.values().map(|v| v.len()).sum();
+        let view_models = names
+            .into_iter()
+            .map(|name| {
+                // Decreasing load; exact reports before approximations on ties.
+                let mut backends = models.remove(&name).unwrap_or_default();
+                backends.sort_by(|a, b| {
+                    b.load
+                        .cmp(&a.load)
+                        .then(b.exact.cmp(&a.exact))
+                });
+                ModelBackends {
+                    id: name,
+                    backends,
+                }
+            })
+            .collect();
+        BackendsView {
+            models: view_models,
+        }
+    }
+
+    /// Last `limit` query-log entries, newest first. Empty when no
+    /// file-backed sink is configured.
+    pub async fn recent_queries(&self, limit: usize) -> Vec<Value> {
+        let Some(path) = self.logger.file_sink_path() else {
+            return Vec::new();
+        };
+        let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+        content
+            .lines()
+            .rev()
+            .take(limit)
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect()
+    }
+
+    /// Render the per-model hive view: for each model, every backend with
+    /// ip, port and the SAME effective load the balancer routes on —
+    /// tracked `server_load`, or `~N` hive-observed in-flight requests
+    /// when the server report doesn't cover them (no tracking, stuck at
+    /// 0, …). Backends ordered by decreasing load.
+    async fn render_view(&self) -> String {
+        let view = self.backends_view().await;
+        let n_backends: usize = view.models.iter().map(|m| m.backends.len()).sum();
         let mut out = format!(
             "🐝 hive: {}, {}",
-            plural(names.len(), "model", "models"),
+            plural(view.models.len(), "model", "models"),
             plural(n_backends, "backend", "backends"),
         );
-        for name in &names {
-            let rows = models.get_mut(name).unwrap();
-            // Decreasing load; exact reports before approximations on ties.
-            rows.sort_by(|a, b| b.1.cmp(&a.1).then(b.2.cmp(&a.2)));
+        for m in &view.models {
             out.push_str(&format!(
-                "\n  {name} ({}):",
-                plural(rows.len(), "backend", "backends")
+                "\n  {} ({}):",
+                m.id,
+                plural(m.backends.len(), "backend", "backends")
             ));
-            for (addr, num, exact) in rows {
-                if *exact {
-                    out.push_str(&format!("\n    {addr} load={num}"));
+            for b in &m.backends {
+                let port = b.port.map(|p| p.to_string()).unwrap_or("?".to_string());
+                if b.exact {
+                    out.push_str(&format!("\n    {}:{port} load={}", b.ip, b.load));
                 } else {
-                    out.push_str(&format!("\n    {addr} load=~{num}"));
+                    out.push_str(&format!("\n    {}:{port} load=~{}", b.ip, b.load));
                 }
             }
         }
@@ -385,6 +429,25 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     } else {
         format!("{n} {many}")
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendInfo {
+    pub ip: String,
+    pub port: Option<u16>,
+    pub load: u64,
+    pub exact: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ModelBackends {
+    pub id: String,
+    pub backends: Vec<BackendInfo>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct BackendsView {
+    pub models: Vec<ModelBackends>,
 }
 
 #[derive(Serialize)]
@@ -796,6 +859,27 @@ pub async fn list_endpoints(State(hive): State<Hive>) -> impl IntoResponse {
     Json(hive.snapshot().await)
 }
 
+/// Per-model backends with the loads the balancer routes on (JSON form
+/// of the stdout hive view). Built for the HiveChat dashboard.
+pub async fn list_backends(State(hive): State<Hive>) -> impl IntoResponse {
+    Json(hive.backends_view().await)
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub struct QueriesQuery {
+    pub limit: Option<usize>,
+}
+
+/// Last query-log entries, newest first (empty without a file sink).
+/// Built for the HiveChat queries view.
+pub async fn list_queries(
+    State(hive): State<Hive>,
+    Query(query): Query<QueriesQuery>,
+) -> impl IntoResponse {
+    let limit = query.limit.unwrap_or(100).min(1000);
+    Json(hive.recent_queries(limit).await)
+}
+
 pub async fn health() -> impl IntoResponse {
     Json(serde_json::json!({ "status": "ok", "hive": "sticky 🐝" }))
 }
@@ -1003,6 +1087,72 @@ mod tests {
             hive.render_view().await,
             "🐝 hive: 0 models, 0 backends"
         );
+    }
+
+    #[tokio::test]
+    async fn backends_view_mirrors_stdout_rows() {
+        let hive = hive_with(
+            vec![
+                ep("busy", 9001, &["m"]),
+                ep("idle", 9002, &["m"]),
+            ],
+            vec![(("busy", "m"), Load::Known(7))],
+        )
+        .await;
+        hive.inflight_inc("http://127.0.0.1:9002").await;
+        hive.inflight_inc("http://127.0.0.1:9002").await;
+        let view = hive.backends_view().await;
+        assert_eq!(view.models.len(), 1);
+        assert_eq!(view.models[0].id, "m");
+        let rows = &view.models[0].backends;
+        assert_eq!(rows.len(), 2);
+        // Decreasing load: exact 7 first, approx ~2 second.
+        assert_eq!(rows[0].ip, "127.0.0.1");
+        assert_eq!(rows[0].port, Some(9001));
+        assert_eq!((rows[0].load, rows[0].exact), (7, true));
+        assert_eq!((rows[1].load, rows[1].exact), (2, false));
+        // Same data the stdout view renders.
+        let text = hive.render_view().await;
+        assert!(text.contains("127.0.0.1:9001 load=7"));
+        assert!(text.contains("127.0.0.1:9002 load=~2"));
+    }
+
+    #[tokio::test]
+    async fn recent_queries_reads_newest_first() {
+        use crate::logging::{JsonLinesSink, LogEntry, RequestLogger};
+        use chrono::Utc;
+        let path = std::env::temp_dir().join("hivllm-test-recent.jsonl");
+        let _ = std::fs::remove_file(&path);
+        let sink = JsonLinesSink::open(path.to_str().unwrap()).await.unwrap();
+        let logger = RequestLogger::new().with_sink(std::sync::Arc::new(sink));
+        for i in 0..3 {
+            logger
+                .log(LogEntry {
+                    ts: Utc::now(),
+                    route: "chat",
+                    model: format!("m{i}"),
+                    upstream: None,
+                    stream: false,
+                    status: 200,
+                    latency_ms: i,
+                    usage: None,
+                    error: None,
+                    request: serde_json::json!({}),
+                    response: None,
+                })
+                .await;
+        }
+        let hive = Hive::new(0).with_logger(logger);
+        let entries = hive.recent_queries(2).await;
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0]["model"], "m2");
+        assert_eq!(entries[1]["model"], "m1");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[tokio::test]
+    async fn recent_queries_empty_without_file_sink() {
+        assert!(Hive::new(0).recent_queries(10).await.is_empty());
     }
 
     #[tokio::test]

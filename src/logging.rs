@@ -392,6 +392,10 @@ where
 pub trait LogSink: Send + Sync {
     fn name(&self) -> &'static str;
     fn emit<'a>(&'a self, entry: LogEntry) -> BoxFuture<'a, ()>;
+    /// Local file this sink appends to, if any (used by `/api/hive/queries`).
+    fn file_path(&self) -> Option<&str> {
+        None
+    }
 }
 
 /// Fan-out logger: every entry goes to every sink. Cheap to clone,
@@ -416,10 +420,18 @@ impl RequestLogger {
             sink.emit(entry.clone()).await;
         }
     }
+
+    /// Path of the first file-backed sink, if any.
+    pub fn file_sink_path(&self) -> Option<String> {
+        self.sinks
+            .iter()
+            .find_map(|s| s.file_path().map(str::to_string))
+    }
 }
 
 /// Appends one JSON object per line: `<entry as JSON>\n`.
 pub struct JsonLinesSink {
+    path: String,
     file: Mutex<tokio::fs::File>,
 }
 
@@ -431,6 +443,7 @@ impl JsonLinesSink {
             .open(path)
             .await?;
         Ok(Self {
+            path: path.to_string(),
             file: Mutex::new(file),
         })
     }
@@ -439,6 +452,10 @@ impl JsonLinesSink {
 impl LogSink for JsonLinesSink {
     fn name(&self) -> &'static str {
         "jsonl"
+    }
+
+    fn file_path(&self) -> Option<&str> {
+        Some(&self.path)
     }
 
     fn emit<'a>(&'a self, entry: LogEntry) -> BoxFuture<'a, ()> {
