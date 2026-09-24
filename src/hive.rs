@@ -274,51 +274,31 @@ impl Hive {
 
     /// Aggregate load of the whole hive (`model = None`) or of one model,
     /// as `(number, exact)`. Served as `GET /load[?model=]` with marker
-    /// `"hivllm": {"exact": bool}` so upstream hives route on real numbers:
-    /// only positively-sighted reports vote exact (a bare `0` never does),
-    /// approximations never launder into exact across hops.
+    /// `"hivllm": {"exact": bool}` so upstream hives route on real numbers.
     ///
-    /// Median of exact votes; with none exact, median of approximations
-    /// (usually `~0`); no members → `(0, false)`. Even counts take the
-    /// floored average of the middle pair.
+    /// The minimum effective load over members: the load the next request
+    /// would face, since the hive routes it to its least-loaded member.
+    /// Exact iff that member's number is (ties prefer exact), so
+    /// approximations never launder into exact across hops. No members →
+    /// `(0, false)`.
     pub async fn aggregate_load(&self, model: Option<&str>) -> (u64, bool) {
         let endpoints = self.endpoints.read().await;
         let loads = self.loads.read().await;
         let inflight = lock(&self.inflight);
-        let mut exact = Vec::new();
-        let mut approx = Vec::new();
-        for ep in endpoints.iter() {
-            for m in &ep.models {
-                if model.is_some_and(|wanted| wanted != m) {
-                    continue;
-                }
+        endpoints
+            .iter()
+            .flat_map(|ep| ep.models.iter().map(move |m| (ep, m)))
+            .filter(|(_, m)| model.is_none_or(|wanted| wanted == m.as_str()))
+            .map(|(ep, m)| {
                 let server = loads
                     .get(&(ep.id.clone(), m.clone()))
                     .copied()
                     .unwrap_or(Load::Unknown);
                 let flying = inflight.get(&ep.base_url).copied().unwrap_or(0);
-                let (num, is_exact) = effective_load(server, flying);
-                if is_exact {
-                    exact.push(num);
-                } else {
-                    approx.push(num);
-                }
-            }
-        }
-        if exact.is_empty() {
-            (Self::median(approx), false)
-        } else {
-            (Self::median(exact), true)
-        }
-    }
-
-    fn median(mut vals: Vec<u64>) -> u64 {
-        vals.sort_unstable();
-        match vals.len() {
-            0 => 0,
-            n if n % 2 == 1 => vals[n / 2],
-            n => vals[n / 2 - 1].saturating_add(vals[n / 2]) / 2,
-        }
+                effective_load(server, flying)
+            })
+            .min_by_key(|&(n, exact)| (n, !exact))
+            .unwrap_or((0, false))
     }
 
     /// Poll load probes for every (endpoint, model) pair (concurrently)
@@ -1599,7 +1579,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_load_is_the_median() {
+    async fn aggregate_load_is_what_the_next_request_faces() {
         let hive = hive_with(
             vec![
                 ep("a", 9001, &["m"]),
@@ -1613,7 +1593,7 @@ mod tests {
             ],
         )
         .await;
-        assert_eq!(hive.aggregate_load(None).await, (30, true));
+        assert_eq!(hive.aggregate_load(None).await, (10, true));
     }
 
     #[tokio::test]
@@ -1622,64 +1602,62 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn aggregate_load_even_counts_average() {
+    async fn measured_idle_members_make_the_hive_exactly_idle() {
+        // One saturated backend next to a measured-idle one: a new request
+        // lands on the idle one, so upstream hives should see exactly 0.
         let hive = hive_with(
-            vec![ep("a", 9001, &["m"]), ep("b", 9002, &["m"])],
-            vec![(("a", "m"), Load::Known(30)), (("b", "m"), Load::Known(32))],
+            vec![ep("idle", 9001, &["m"]), ep("hot", 9002, &["m"])],
+            vec![(("idle", "m"), Load::Measured(0)), (("hot", "m"), Load::Measured(32))],
         )
         .await;
-        assert_eq!(hive.aggregate_load(None).await, (31, true));
+        assert_eq!(hive.aggregate_load(None).await, (0, true));
     }
 
     #[tokio::test]
-    async fn aggregate_load_exact_outvotes_approximations() {
-        // The user's case: one saturated backend (32) next to idle and
-        // untracked ones — the pressure must stay visible, not median
-        // itself away into `median(0, 0, 32) == 0`.
+    async fn unverified_minimum_stays_approximate() {
+        // `/load`'s bare 0 (idle or untracked?) and an untracked member:
+        // the next request may land on either, so the answer is ~0 —
+        // never passed off as exact, even next to an exact 32.
         let hive = hive_with(
             vec![
-                ep("idle", 9001, &["m"]),
+                ep("maybe", 9001, &["m"]),
                 ep("hot", 9002, &["m"]),
                 ep("mystery", 9003, &["m"]),
             ],
-            vec![(("idle", "m"), Load::Known(0)), (("hot", "m"), Load::Known(32))],
+            vec![(("maybe", "m"), Load::Known(0)), (("hot", "m"), Load::Known(32))],
         )
         .await;
-        assert_eq!(hive.aggregate_load(None).await, (32, true));
-    }
-
-    #[tokio::test]
-    async fn aggregate_load_falls_back_to_approximations() {
-        let hive = hive_with(
+        assert_eq!(hive.aggregate_load(None).await, (0, false));
+        // Ties between an exact and an approximate minimum prefer exact.
+        let tie = hive_with(
             vec![ep("a", 9001, &["m"]), ep("b", 9002, &["m"])],
-            vec![],
+            vec![(("a", "m"), Load::Known(3)), (("b", "m"), Load::Known(0))],
         )
         .await;
-        std::mem::forget(hive.track_inflight("http://127.0.0.1:9002")); // held open
-        std::mem::forget(hive.track_inflight("http://127.0.0.1:9002")); // held open
-        // No exact loads: median of approximations (0, 2) → 1.
-        assert_eq!(hive.aggregate_load(None).await, (1, false));
+        for _ in 0..3 {
+            std::mem::forget(tie.track_inflight("http://127.0.0.1:9002")); // held open
+        }
+        assert_eq!(tie.aggregate_load(None).await, (3, true));
     }
 
     #[tokio::test]
     async fn aggregate_load_scopes_to_one_model() {
-        // "hot" is pressured on m2 only; "cold" serves m1 while idle.
-        // ?model=m2 must report hot's 12, not an average smeared with m1.
+        // "hot" is pressured on m2 only; "cold" serves m1 measured-idle.
+        // ?model=m2 must report hot's 12, not something smeared with m1.
         let hive = hive_with(
             vec![
                 ep("hot", 9001, &["m1", "m2"]),
                 ep("cold", 9002, &["m1"]),
             ],
             vec![
-                ((("hot", "m1")), Load::Known(4)),
-                ((("hot", "m2")), Load::Known(12)),
-                ((("cold", "m1")), Load::Known(0)),
+                (("hot", "m1"), Load::Measured(4)),
+                (("hot", "m2"), Load::Measured(12)),
+                (("cold", "m1"), Load::Measured(0)),
             ],
         )
         .await;
         assert_eq!(hive.aggregate_load(Some("m2")).await, (12, true));
-        // m1: exact {4} outvotes cold's unverified zero.
-        assert_eq!(hive.aggregate_load(Some("m1")).await, (4, true));
+        assert_eq!(hive.aggregate_load(Some("m1")).await, (0, true));
         assert_eq!(hive.aggregate_load(Some("nope")).await, (0, false));
     }
 
@@ -1687,7 +1665,7 @@ mod tests {
     async fn load_endpoint_accepts_model_param() {
         let hive = hive_with(
             vec![ep("hot", 9001, &["m1", "m2"])],
-            vec![((("hot", "m2")), Load::Known(12))],
+            vec![(("hot", "m2"), Load::Known(12))],
         )
         .await;
         let resp = server_load(

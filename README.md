@@ -36,11 +36,14 @@ and gathers them behind a **single endpoint**.
       repeat them), nor timeouts / `504` (the generation may still be
       running).
     - Stdout shows the same numbers the balancer uses, per model:
-      positive server reports as `load=N`, anything unverified as
-      `load=~N` (unknown backends, or a `0` that could equally mean idle
-      or untracked). Backends ordered by decreasing load.
-   - `GET /load[?model=]` reports the hive's own aggregate pressure
-     (median of member effective loads, exact reports only) with marker
+      exact reports as `load=N` (`/metrics` gauges and peer-hive exact
+      aggregates, zero included; `/load` only when positive), anything
+      unverified as `load=~N` (unknown backends, or a `/load` `0` that
+      could equally mean idle or untracked). Backends ordered by
+      decreasing load.
+   - `GET /load[?model=]` reports the hive's own aggregate pressure —
+     the minimum member effective load, i.e. what the next request would
+     face, exact only if that member's number is — with marker
      `"hivllm": {"exact": bool}` so upstream hives route on real numbers —
      per model when `?model=` is given, global otherwise. Unverified
      aggregates are marked inexact and never trusted downstream, so a

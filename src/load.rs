@@ -24,16 +24,21 @@ use std::time::Duration;
 /// Load of one backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Load {
-    /// Actively tracked request count (vLLM `server_load`) — NOT GPU utilization.
+    /// Request count from a source whose `0` proves nothing: vLLM's
+    /// `/load` answers a permanent bogus `0` without
+    /// `--enable-server-load-tracking` — NOT GPU utilization.
     Known(u64),
+    /// Request count from a source where `0` really means idle: vLLM's
+    /// `/metrics` gauges, or a peer hive's exact aggregate.
+    Measured(u64),
     /// No usable signal: no `/load` route, error, tracking disabled, or a
     /// non-vLLM server. Backend stays fully usable; routing falls back to
     /// round-robin for it.
     Unknown,
 }
 
-/// One mechanism for reading a backend's load. The first `Known` result
-/// wins; anything else must yield `Unknown`, never an exclusion.
+/// One mechanism for reading a backend's load. The first result other
+/// than `Unknown` wins; no signal must yield `Unknown`, never an exclusion.
 /// `model` scopes the reading; server-level probes (vLLM) may ignore it
 /// (their whole box is busy for every model they serve).
 pub trait LoadProbe: Send + Sync {
@@ -86,7 +91,7 @@ impl LoadProbe for VllmMetricsProbe {
                 Err(_) => return Load::Unknown,
             };
             match parse_vllm_load(&text) {
-                Some(n) => Load::Known(n),
+                Some(n) => Load::Measured(n),
                 None => Load::Unknown,
             }
         })
@@ -185,7 +190,7 @@ impl LoadProbe for HivLoadProbe {
                 v.as_u64()
                     .or_else(|| v.as_f64().map(|f| f.max(0.0) as u64))
             }) {
-                Some(n) => Load::Known(n),
+                Some(n) => Load::Measured(n),
                 None => Load::Unknown,
             }
         })
@@ -244,7 +249,8 @@ impl LoadProbe for VllmLoadProbe {
     }
 }
 
-/// Poll every probe for one backend + model; first `Known` wins, else `Unknown`.
+/// Poll every probe for one backend + model; the first signal wins, else
+/// `Unknown`.
 pub async fn probe_backend(
     probes: &[Arc<dyn LoadProbe>],
     client: &reqwest::Client,
@@ -252,8 +258,9 @@ pub async fn probe_backend(
     model: &str,
 ) -> Load {
     for probe in probes {
-        if let Load::Known(n) = probe.probe(client, base_url, model).await {
-            return Load::Known(n);
+        match probe.probe(client, base_url, model).await {
+            Load::Unknown => continue,
+            load => return load,
         }
     }
     Load::Unknown
@@ -267,16 +274,19 @@ pub async fn probe_backend(
 /// number is an exact server report (`true`) or a hive-observed
 /// approximation (`false`, displayed with a `~` prefix).
 ///
-/// Rationale: `server_load` is only trustworthy when the server runs with
-/// `--enable-server-load-tracking`; without it some versions answer a
-/// permanent bogus `0`. A positive sighting proves tracking works, but a
-/// bare `0` proves nothing (idle and untracked look identical), so zero
-/// is always reported as an approximation. Hive-observed in-flight
-/// requests are always real, so `max()` degrades gracefully.
+/// Rationale: `/load`'s `server_load` is only trustworthy when the server
+/// runs with `--enable-server-load-tracking`; without it some versions
+/// answer a permanent bogus `0`. A positive sighting proves tracking
+/// works, but a bare `0` from it proves nothing (idle and untracked look
+/// identical), so that zero is reported as an approximation. A
+/// [`Load::Measured`] zero is real. Either way, a server number below
+/// what the hive itself has in flight (the poll is seconds old) yields to
+/// the hive's count, as an approximation.
 pub fn effective_load(server: Load, inflight: u64) -> (u64, bool) {
     match server {
         Load::Known(n) if n > 0 && n >= inflight => (n, true),
-        Load::Known(n) => (n.max(inflight), false),
+        Load::Measured(n) if n >= inflight => (n, true),
+        Load::Known(n) | Load::Measured(n) => (n.max(inflight), false),
         Load::Unknown => (inflight, false),
     }
 }
@@ -378,6 +388,12 @@ mod tests {
             probe_backend(&probes, &client(), "http://127.0.0.1:9", "m").await,
             Load::Known(7)
         );
+        let measured: Vec<Arc<dyn LoadProbe>> =
+            vec![Arc::new(FixedProbe(Load::Measured(0))), Arc::new(FixedProbe(Load::Known(7)))];
+        assert_eq!(
+            probe_backend(&measured, &client(), "http://127.0.0.1:9", "m").await,
+            Load::Measured(0)
+        );
         let none: Vec<Arc<dyn LoadProbe>> = vec![Arc::new(FixedProbe(Load::Unknown))];
         assert_eq!(
             probe_backend(&none, &client(), "http://127.0.0.1:9", "m").await,
@@ -395,6 +411,14 @@ mod tests {
         assert_eq!(effective_load(Load::Known(0), 3), (3, false));
         assert_eq!(effective_load(Load::Unknown, 2), (2, false));
         assert_eq!(effective_load(Load::Unknown, 0), (0, false));
+    }
+
+    #[test]
+    fn measured_zero_is_exact_idle() {
+        assert_eq!(effective_load(Load::Measured(0), 0), (0, true));
+        assert_eq!(effective_load(Load::Measured(4), 1), (4, true));
+        // Older than what the hive sees in flight right now: hive wins.
+        assert_eq!(effective_load(Load::Measured(0), 2), (2, false));
     }
 
     const SAMPLE_METRICS: &str = r#"
@@ -441,7 +465,7 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
         .await;
         assert_eq!(
             VllmMetricsProbe.probe(&client(), &url, "m").await,
-            Load::Known(39)
+            Load::Measured(39)
         );
     }
 
@@ -467,12 +491,12 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
         .await;
         assert_eq!(
             HivLoadProbe.probe(&client(), &url, "hot").await,
-            Load::Known(12)
+            Load::Measured(12)
         );
-        // Exact zero is still exact (positively sighted).
+        // An exact zero from a hive really means idle.
         assert_eq!(
             HivLoadProbe.probe(&client(), &url, "cold").await,
-            Load::Known(0)
+            Load::Measured(0)
         );
     }
 
