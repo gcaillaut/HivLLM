@@ -75,6 +75,10 @@ pub struct Hive {
     /// Last rendered hive view (change detection for stdout logging).
     last_view: Arc<Mutex<String>>,
     endpoints: Arc<RwLock<Vec<DiscoveredEndpoint>>>,
+    /// Serialises discovery passes (periodic rescan, Docker events): a slow
+    /// pass finishing after a newer one would otherwise overwrite fresh
+    /// membership with stale results.
+    scan_lock: Arc<Mutex<()>>,
     /// (model, effective load) -> next index. Equal effective loads rotate
     /// round-robin. All-idle degrades to plain round-robin.
     rr: Arc<Mutex<HashMap<(String, RankKey), usize>>>,
@@ -102,6 +106,7 @@ impl Hive {
             max_body: Some(DEFAULT_MAX_BODY),
             last_view: Arc::new(Mutex::new(String::new())),
             endpoints: Arc::new(RwLock::new(Vec::new())),
+            scan_lock: Arc::new(Mutex::new(())),
             rr: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -159,14 +164,34 @@ impl Hive {
         docker: Option<&DockerDiscovery>,
     ) {
         let me = self.own_id.as_str();
-        let found = discover(&self.client, extra_ports, &[self.own_port], me).await;
-        let pinned = probe_static(&self.client, static_backends, me).await;
-        let mut all = merge_endpoints(found, pinned);
-        if let Some(d) = docker {
-            let docked = d.container_backends(&self.client, me).await;
-            all = merge_endpoints(all, docked);
-        }
-        self.set_endpoints(all).await;
+        let own_port = [self.own_port];
+        self.scan_and_install(async {
+            let docked = async {
+                match docker {
+                    Some(d) => d.container_backends(&self.client, me).await,
+                    None => Vec::new(),
+                }
+            };
+            let (found, pinned, docked) = tokio::join!(
+                discover(&self.client, extra_ports, &own_port, me),
+                probe_static(&self.client, static_backends, me),
+                docked,
+            );
+            merge_endpoints(merge_endpoints(found, pinned), docked)
+        })
+        .await;
+    }
+
+    /// Run one discovery pass and install its result, one pass at a time:
+    /// a pass starts probing only after the previous one is installed, so
+    /// the last write is always the freshest view.
+    async fn scan_and_install<F>(&self, scan: F)
+    where
+        F: std::future::Future<Output = Vec<DiscoveredEndpoint>>,
+    {
+        let _one_pass_at_a_time = self.scan_lock.lock().await;
+        let found = scan.await;
+        self.set_endpoints(found).await;
     }
 
     /// Install a freshly probed member list, minus anything that leads
@@ -2303,5 +2328,45 @@ mod tests {
         assert_eq!(resp.status(), 200);
         assert_eq!(resp.headers()["content-type"], "text/event-stream");
         assert_eq!(resp.headers()["cache-control"], "no-cache");
+    }
+
+    #[tokio::test]
+    async fn overlapping_scans_never_install_stale_results() {
+        // First `/v1/models` answer is slow and stale ("old"), later ones
+        // are fast and fresh ("new"). Unserialised, the fast second pass
+        // would install "new" and then the slow first pass would overwrite
+        // it with "old".
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let c = calls.clone();
+        let mock = Router::new().route(
+            "/v1/models",
+            get(move || {
+                let c = c.clone();
+                async move {
+                    let n = c.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if n == 0 {
+                        tokio::time::sleep(Duration::from_millis(400)).await;
+                        Json(serde_json::json!({"data": [{"id": "old"}]}))
+                    } else {
+                        Json(serde_json::json!({"data": [{"id": "new"}]}))
+                    }
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let hive = Hive::new(0);
+        let pass = |h: Hive, u: String| async move {
+            let id = h.own_id();
+            h.scan_and_install(probe_static(&h.client, &[u], &id)).await;
+        };
+        let first = tokio::spawn(pass(hive.clone(), url.clone()));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let second = tokio::spawn(pass(hive.clone(), url.clone()));
+        first.await.unwrap();
+        second.await.unwrap();
+        assert_eq!(hive.snapshot().await[0].models, vec!["new".to_string()]);
     }
 }
