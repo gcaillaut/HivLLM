@@ -110,6 +110,7 @@ impl DockerDiscovery {
                                 source: "docker".to_string(),
                                 hive_id: probed.hive_id,
                                 paths: probed.paths,
+                                model_meta: probed.model_meta,
                             });
                         }
                     }

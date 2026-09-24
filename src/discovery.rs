@@ -32,6 +32,10 @@ pub struct DiscoveredEndpoint {
     /// member's own id (path vector, see [`hive_paths`]).
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub paths: HashMap<String, Vec<Vec<String>>>,
+    /// Model → the upstream's `/v1/models` object (`max_model_len`,
+    /// `root`, …), re-served by the hive's `/v1/models`.
+    #[serde(default, skip_serializing)]
+    pub model_meta: HashMap<String, serde_json::Value>,
 }
 
 /// Request header carrying the comma-separated instance ids of hives that
@@ -54,12 +58,14 @@ pub struct Probed {
     pub hive_id: Option<String>,
     /// Hive backends only: see [`DiscoveredEndpoint::paths`].
     pub paths: HashMap<String, Vec<Vec<String>>>,
+    /// See [`DiscoveredEndpoint::model_meta`].
+    pub model_meta: HashMap<String, serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 struct ModelList {
     #[serde(default)]
-    data: Vec<ModelEntry>,
+    data: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -142,15 +148,19 @@ pub fn server_root(base_url: &str) -> String {
     }
 }
 
-/// Join a base URL with an OpenAI API path (`/v1/chat/completions`, …)
-/// without doubling a `/v1` prefix the base already carries.
+/// Join a base URL with an API path without doubling a `/v1` prefix the
+/// base already carries. OpenAI paths (`/v1/…`) go under the base; other
+/// server routes (`/tokenize`, `/v2/rerank`, …) live next to `/v1`, at
+/// the [`server_root`].
 pub fn join_upstream_path(base_url: &str, api_path: &str) -> String {
     let b = base_url.trim_end_matches('/');
-    if b.ends_with("/v1") && api_path.starts_with("/v1") {
-        format!("{b}{}", &api_path[3..])
-    } else {
-        format!("{b}{api_path}")
+    if let Some(rest) = api_path.strip_prefix("/v1").filter(|r| r.is_empty() || r.starts_with('/')) {
+        if b.ends_with("/v1") {
+            return format!("{b}{rest}");
+        }
+        return format!("{b}{api_path}");
     }
+    format!("{}{api_path}", server_root(b))
 }
 
 /// Probe a single base URL for OpenAI compat. Returns model ids (and, for
@@ -180,8 +190,13 @@ pub async fn probe_openai_endpoint(
         .map(str::to_string);
     let body: ModelList = resp.json().await.ok()?;
     let mut paths: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    let mut model_meta = HashMap::new();
     let mut models = Vec::new();
-    for entry in body.data {
+    for raw in body.data {
+        let Ok(entry) = serde_json::from_value::<ModelEntry>(raw.clone()) else {
+            continue; // no string `id`
+        };
+        model_meta.insert(entry.id.clone(), raw);
         if let Some(hid) = &hive_id {
             let found = hive_paths(hid, entry.hivllm.as_ref());
             if found.is_empty() {
@@ -197,6 +212,7 @@ pub async fn probe_openai_endpoint(
         models,
         hive_id,
         paths,
+        model_meta,
     })
 }
 
@@ -355,6 +371,7 @@ pub async fn discover(
                     source: source.to_string(),
                     hive_id: probed.hive_id,
                     paths: probed.paths,
+                    model_meta: probed.model_meta,
                 })
             }
         })
@@ -425,6 +442,7 @@ pub async fn probe_static(
                     source: "static".to_string(),
                     hive_id: probed.hive_id,
                     paths: probed.paths,
+                    model_meta: probed.model_meta,
                 })
             }
         })
@@ -458,6 +476,9 @@ pub fn merge_endpoints(
                 }
                 if existing.hive_id.is_none() {
                     existing.hive_id = ep.hive_id;
+                }
+                for (model, meta) in ep.model_meta {
+                    existing.model_meta.entry(model).or_insert(meta);
                 }
                 for (model, paths) in ep.paths {
                     let slot = existing.paths.entry(model).or_default();
@@ -520,6 +541,7 @@ mod tests {
                 source: source.into(),
                 hive_id: None,
                 paths: HashMap::new(),
+                model_meta: HashMap::new(),
             }
         }
         let out = merge_endpoints(
@@ -567,6 +589,14 @@ mod tests {
         assert_eq!(
             join_upstream_path("http://127.0.0.1:8000", "/v1/chat/completions"),
             "http://127.0.0.1:8000/v1/chat/completions"
+        );
+        assert_eq!(
+            join_upstream_path("http://127.0.0.1:8180/general-stage1/v1", "/tokenize"),
+            "http://127.0.0.1:8180/general-stage1/tokenize"
+        );
+        assert_eq!(
+            join_upstream_path("http://127.0.0.1:8000", "/v2/rerank"),
+            "http://127.0.0.1:8000/v2/rerank"
         );
     }
 

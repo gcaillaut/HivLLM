@@ -20,10 +20,18 @@ and gathers them behind a **single endpoint**.
      wedged Docker daemon never stalls discovery.
 
 2. **Unified hive** (`src/hive.rs`, `src/load.rs`)
-   - `GET /v1/models` → aggregated model list from all members.
-   - `POST /v1/chat/completions`, `/v1/completions`, `/v1/embeddings` →
-     routed by `model`
-     (JSON body field; `?model=` query param wins as override).
+   - `GET /v1/models` → aggregated model list from all members (upstream
+     metadata such as `max_model_len` kept); `GET /v1/models/{id}` → one.
+   - Routed by `model` (JSON body field, or the `model` form field of
+     multipart uploads; `?model=` query param wins as override):
+     - OpenAI: `POST /v1/chat/completions`, `/v1/completions`,
+       `/v1/embeddings`, `/v1/responses`, `/v1/audio/speech`,
+       `/v1/audio/transcriptions`, `/v1/audio/translations`
+     - vLLM & co: `/v1/rerank`, `/v2/rerank`, `/rerank`, `/v1/score`,
+       `/score`, `/pooling`, `/classify`, `/tokenize`, `/detokenize`
+       (non-`/v1` routes go to the server root, next to a gateway's `/v1`)
+     - Audio uploads are forwarded byte for byte; the query log records
+       their form fields and file names / sizes, not the audio itself.
     - **Load-aware routing**: backends are polled (`--load-interval`, default
       5s) via provider probes — vLLM `GET /metrics`
       (`num_requests_running` + `num_requests_waiting`, always exported)

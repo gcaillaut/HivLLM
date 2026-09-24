@@ -16,6 +16,7 @@ mod docker;
 mod hive;
 mod load;
 mod logging;
+mod multipart;
 
 use axum::{
     extract::Request,
@@ -292,10 +293,11 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = SocketAddr::from((args.bind, args.port));
     tracing::info!("🐝 HivLLM hive {} listening on http://{addr}", hive_id);
-    tracing::info!("   GET  /v1/models");
-    tracing::info!("   POST /v1/chat/completions  (route by `model`)");
-    tracing::info!("   POST /v1/completions       (route by `model`)");
-    tracing::info!("   POST /v1/embeddings        (route by `model`)");
+    tracing::info!("   GET  /v1/models, /v1/models/{{id}}");
+    tracing::info!("   POST /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/responses");
+    tracing::info!("   POST rerank / score / pooling / classify / tokenize / detokenize");
+    tracing::info!("   POST /v1/audio/speech, /v1/audio/transcriptions, /v1/audio/translations");
+    tracing::info!("        (all routed by `model`)");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
     axum::serve(listener, app)

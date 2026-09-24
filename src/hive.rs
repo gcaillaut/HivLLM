@@ -682,33 +682,19 @@ pub struct BackendsView {
     pub models: Vec<ModelBackends>,
 }
 
-#[derive(Serialize)]
-struct ModelObject {
-    id: String,
-    object: &'static str,
-    created: u64,
-    owned_by: String,
-    /// Routes behind this model, for peer hives (path vector).
-    hivllm: HivModelMeta,
-}
-
-#[derive(Serialize)]
-struct ModelsResponse {
-    object: &'static str,
-    data: Vec<ModelObject>,
-}
-
-/// Aggregated model list. A probing hive sends its id as Via: models
-/// it could only reach back through itself are left out, and each model
-/// carries its loop-free routes so peers can do the same one hop further.
-pub async fn list_models(State(hive): State<Hive>, headers: HeaderMap) -> impl IntoResponse {
+/// OpenAI model objects for everything this hive can serve to a caller
+/// whose Via path is in `headers`. Built on the upstream's own object
+/// (`max_model_len`, `root`, … survive) with the hive's fields on top:
+/// `owned_by` names the member, and `hivllm.paths` carries the model's
+/// loop-free routes so peer hives can filter one hop further. Models the
+/// caller could only reach back through itself are left out.
+async fn model_objects(hive: &Hive, headers: &HeaderMap) -> Vec<Value> {
     let endpoints = hive.snapshot().await;
-    let mut avoid: HashSet<String> = parse_via(&headers).into_iter().collect();
+    let mut avoid: HashSet<String> = parse_via(headers).into_iter().collect();
     avoid.insert(hive.own_id());
     let mut seen = HashSet::new();
     let mut data = Vec::new();
     for ep in &endpoints {
-        let owner = ep.name.clone();
         for m in &ep.models {
             if !seen.insert(m.clone()) {
                 continue;
@@ -717,20 +703,40 @@ pub async fn list_models(State(hive): State<Hive>, headers: HeaderMap) -> impl I
             if paths.is_empty() {
                 continue;
             }
-            data.push(ModelObject {
-                id: m.clone(),
-                object: "model",
-                created: 0,
-                owned_by: owner.clone(),
-                hivllm: HivModelMeta { paths },
-            });
+            let mut obj = match ep.model_meta.get(m) {
+                Some(Value::Object(o)) => o.clone(),
+                _ => serde_json::Map::new(),
+            };
+            obj.insert("id".into(), Value::String(m.clone()));
+            obj.insert("object".into(), Value::String("model".into()));
+            obj.entry("created").or_insert(Value::from(0));
+            obj.insert("owned_by".into(), Value::String(ep.name.clone()));
+            obj.insert(
+                "hivllm".into(),
+                serde_json::to_value(HivModelMeta { paths }).unwrap_or_default(),
+            );
+            data.push(Value::Object(obj));
         }
     }
-    data.sort_by(|a, b| a.id.cmp(&b.id));
-    Json(ModelsResponse {
-        object: "list",
-        data,
-    })
+    data.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+    data
+}
+
+/// Aggregated model list (see [`model_objects`]).
+pub async fn list_models(State(hive): State<Hive>, headers: HeaderMap) -> impl IntoResponse {
+    Json(serde_json::json!({ "object": "list", "data": model_objects(&hive, &headers).await }))
+}
+
+/// `GET /v1/models/{id}`: one model object, or 404.
+pub async fn get_model(
+    State(hive): State<Hive>,
+    axum::extract::Path(id): axum::extract::Path<String>,
+    headers: HeaderMap,
+) -> Response {
+    match model_objects(&hive, &headers).await.into_iter().find(|m| m["id"] == id.as_str()) {
+        Some(m) => Json(m).into_response(),
+        None => json_error(StatusCode::NOT_FOUND, format!("model `{id}` not found in hive")),
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -740,14 +746,6 @@ pub struct ModelQuery {
     pub model: Option<String>,
 }
 
-fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
-    if let Some(m) = &query.model {
-        if !m.is_empty() {
-            return Some(m.clone());
-        }
-    }
-    body.get("model")?.as_str().map(|s| s.to_string())
-}
 
 /// Default consecutive failed scans before a member leaves.
 pub const DEFAULT_DROP_AFTER: u32 = 3;
@@ -865,9 +863,29 @@ pub fn routes(hive: Hive) -> axum::Router {
         .route("/health", get(health))
         .route("/load", get(server_load))
         .route("/v1/models", get(list_models))
+        .route("/v1/models/:id", get(get_model))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
+        .route("/v1/responses", model_route("responses", "/v1/responses"))
+        .route("/v1/rerank", model_route("rerank", "/v1/rerank"))
+        .route("/v2/rerank", model_route("rerank", "/v2/rerank"))
+        .route("/rerank", model_route("rerank", "/rerank"))
+        .route("/v1/score", model_route("score", "/v1/score"))
+        .route("/score", model_route("score", "/score"))
+        .route("/pooling", model_route("pooling", "/pooling"))
+        .route("/classify", model_route("classify", "/classify"))
+        .route("/tokenize", model_route("tokenize", "/tokenize"))
+        .route("/detokenize", model_route("detokenize", "/detokenize"))
+        .route("/v1/audio/speech", model_route("speech", "/v1/audio/speech"))
+        .route(
+            "/v1/audio/transcriptions",
+            model_route("transcriptions", "/v1/audio/transcriptions"),
+        )
+        .route(
+            "/v1/audio/translations",
+            model_route("translations", "/v1/audio/translations"),
+        )
         .route("/api/hive/endpoints", get(list_endpoints))
         .route("/api/hive/backends", get(list_backends))
         .route("/api/hive/queries", get(list_queries))
@@ -966,6 +984,79 @@ pub async fn embeddings(
     proxy_by_model(hive, query, headers, body, "embeddings", "/v1/embeddings").await
 }
 
+/// A routable request: its model, what to forward, and what to log.
+struct ParsedRequest {
+    model: String,
+    /// Logged form of the request (the JSON body, or a form description).
+    request: Value,
+    body: Bytes,
+    content_type: String,
+    stream: bool,
+}
+
+/// Read the model and forwarding details from a JSON body, or from a
+/// `multipart/form-data` upload (audio). `?model=` wins over the body;
+/// for JSON the forwarded body is rewritten so upstreams see it too
+/// (multipart bodies are forwarded untouched). Errors carry what to log.
+fn parse_request(
+    query: &ModelQuery,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<ParsedRequest, (String, Value)> {
+    let content_type = headers
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("application/json")
+        .to_string();
+    let query_model = query.model.clone().filter(|m| !m.is_empty());
+    if let Some(boundary) = crate::multipart::boundary(&content_type) {
+        let parts = crate::multipart::parse(&body, &boundary);
+        let request = crate::multipart::describe(&parts);
+        let Some(model) =
+            query_model.or_else(|| crate::multipart::field(&parts, "model").map(str::to_string))
+        else {
+            return Err(("missing `model`: set form field `model` or ?model=...".into(), request));
+        };
+        let stream = crate::multipart::field(&parts, "stream") == Some("true");
+        return Ok(ParsedRequest {
+            model,
+            request,
+            body,
+            content_type,
+            stream,
+        });
+    }
+    let mut value: Value = serde_json::from_slice(&body)
+        .map_err(|_| ("invalid JSON body".to_string(), Value::Null))?;
+    let Some(model) = query_model.or_else(|| value.get("model")?.as_str().map(str::to_string))
+    else {
+        let msg = "missing `model`: set JSON body {\"model\": \"...\"} or ?model=...";
+        return Err((msg.to_string(), value));
+    };
+    if let Some(obj) = value.as_object_mut() {
+        obj.insert("model".to_string(), Value::String(model.clone()));
+    }
+    let stream = value.get("stream").and_then(Value::as_bool).unwrap_or(false);
+    let body = Bytes::from(serde_json::to_vec(&value).unwrap_or_default());
+    Ok(ParsedRequest {
+        model,
+        request: value,
+        body,
+        content_type: "application/json".to_string(),
+        stream,
+    })
+}
+
+/// `POST` route forwarded as-is to a backend serving the request's model
+/// (JSON body or multipart form), logged under `label`.
+fn model_route(label: &'static str, path: &'static str) -> axum::routing::MethodRouter<Hive> {
+    axum::routing::post(
+        move |State(hive): State<Hive>, Query(query): Query<ModelQuery>, headers: HeaderMap, body: Bytes| {
+            proxy_by_model(hive, query, headers, body, label, path)
+        },
+    )
+}
+
 /// One proxied-query outcome, assembled at each exit of [`proxy_by_model`].
 struct Outcome {
     model: String,
@@ -1006,11 +1097,9 @@ async fn proxy_by_model(
     upstream_path: &str,
 ) -> Response {
     let start = Instant::now();
-    // Parse body as JSON value (keep raw for forwarding).
-    let mut value: Value = match serde_json::from_slice(&body) {
-        Ok(v) => v,
-        Err(_) => {
-            let msg = "invalid JSON body".to_string();
+    let parsed = match parse_request(&query, &headers, body) {
+        Ok(p) => p,
+        Err((msg, request)) => {
             log_query(
                 &hive,
                 route,
@@ -1021,7 +1110,7 @@ async fn proxy_by_model(
                     status: StatusCode::BAD_REQUEST,
                     usage: None,
                     error: Some(msg.clone()),
-                    request: Value::Null,
+                    request,
                     response: None,
                 },
                 start,
@@ -1030,32 +1119,13 @@ async fn proxy_by_model(
             return json_error(StatusCode::BAD_REQUEST, msg);
         }
     };
-
-    let Some(model) = resolve_model(&query, &value) else {
-        let msg = "missing `model`: set JSON body {\"model\": \"...\"} or ?model=...".to_string();
-        log_query(
-            &hive,
-            route,
-            Outcome {
-                model: String::new(),
-                upstream: None,
-                stream: false,
-                status: StatusCode::BAD_REQUEST,
-                usage: None,
-                error: Some(msg.clone()),
-                request: value,
-                response: None,
-            },
-            start,
-        )
-        .await;
-        return json_error(StatusCode::BAD_REQUEST, msg);
-    };
-
-    // If ?model= was used, normalize the forwarded body so upstreams see it too.
-    if let Some(obj) = value.as_object_mut() {
-        obj.insert("model".to_string(), Value::String(model.clone()));
-    }
+    let ParsedRequest {
+        model,
+        request: value,
+        body: fwd_body,
+        content_type,
+        stream: stream_mode,
+    } = parsed;
 
     let via_path = parse_via(&headers);
     let visited: HashSet<String> = via_path.iter().cloned().collect();
@@ -1118,8 +1188,6 @@ async fn proxy_by_model(
         return json_error(StatusCode::NOT_FOUND, msg);
     }
 
-    let stream_mode = value.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    let fwd_body = serde_json::to_vec(&value).unwrap_or_default();
 
     // The client's token is only passed on when the operator opted in:
     // otherwise it would reach every candidate (random discovered ports,
@@ -1149,7 +1217,7 @@ async fn proxy_by_model(
         let mut req = hive
             .client
             .post(&url)
-            .header("Content-Type", "application/json")
+            .header(axum::http::header::CONTENT_TYPE, content_type.as_str())
             .header(VIA_HEADER, fwd_via.clone())
             .body(fwd_body.clone());
         if let Some(a) = &auth {
@@ -1409,6 +1477,7 @@ mod tests {
             source: "test".into(),
             hive_id: None,
             paths: HashMap::new(),
+            model_meta: HashMap::new(),
         }
     }
 
@@ -1772,6 +1841,7 @@ mod tests {
                 source: "test".into(),
                 hive_id: None,
                 paths: HashMap::new(),
+                model_meta: HashMap::new(),
             }
         }
 
@@ -2177,6 +2247,7 @@ mod tests {
             models: vec!["m".into()],
             source: "test".into(),
             hive_id: Some(hid.into()),
+            model_meta: HashMap::new(),
             paths: HashMap::from([(
                 "m".to_string(),
                 paths
@@ -2576,5 +2647,106 @@ mod tests {
         let entry = entry.expect("stream logged");
         assert!(entry.error.as_deref().unwrap_or("").starts_with("stream broken"), "{:?}", entry.error);
         assert_eq!(entry.response.unwrap().content.as_deref(), Some("half"));
+    }
+
+    /// Mock recording (path, content-type, body) of every request.
+    async fn recording_backend() -> (String, Arc<StdMutex<Vec<(String, String, Bytes)>>>) {
+        let seen = Arc::new(StdMutex::new(Vec::new()));
+        let s2 = seen.clone();
+        let mock = Router::new()
+            .fallback(move |uri: axum::http::Uri, headers: HeaderMap, body: Bytes| {
+                let s2 = s2.clone();
+                async move {
+                    let ct = headers
+                        .get("content-type")
+                        .map(|v| v.to_str().unwrap().to_string())
+                        .unwrap_or_default();
+                    lock(&s2).push((uri.path().to_string(), ct, body));
+                    Json(serde_json::json!({"ok": true}))
+                }
+            })
+            .layer(axum::extract::DefaultBodyLimit::disable());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        (url, seen)
+    }
+
+    #[tokio::test]
+    async fn extra_routes_reach_the_right_upstream_paths() {
+        let (url, seen) = recording_backend().await;
+        let mut gw = ep("gw", 1, &["m"]);
+        gw.base_url = format!("{url}/gw/v1"); // path-routing gateway
+        let hive = hive_with(vec![gw], vec![]).await;
+        let proxy = serve_proxy(hive).await;
+        let c = reqwest::Client::new();
+        for (path, expected) in [
+            ("/v1/responses", "/gw/v1/responses"),
+            ("/v1/rerank", "/gw/v1/rerank"),
+            ("/v2/rerank", "/gw/v2/rerank"),
+            ("/tokenize", "/gw/tokenize"),
+            ("/v1/audio/speech", "/gw/v1/audio/speech"),
+        ] {
+            let resp = c
+                .post(format!("{proxy}{path}"))
+                .json(&serde_json::json!({"model": "m", "input": "x"}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200, "{path}");
+            assert_eq!(lock(&seen).last().unwrap().0, expected);
+        }
+    }
+
+    #[tokio::test]
+    async fn audio_uploads_route_by_form_field_and_pass_through_intact() {
+        let (url, seen) = recording_backend().await;
+        let mut whisper = ep("w", 1, &["whisper"]);
+        whisper.base_url = url;
+        let capture = Arc::new(Capture::default());
+        let hive = hive_with(vec![whisper], vec![])
+            .await
+            .with_logger(RequestLogger::new().with_sink(capture.clone()));
+        let proxy = serve_proxy(hive).await;
+        let body: &[u8] = b"--B0\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nwhisper\r\n\
+--B0\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.wav\"\r\n\
+Content-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n--B0--\r\n";
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy}/v1/audio/transcriptions"))
+            .header("content-type", "multipart/form-data; boundary=B0")
+            .body(body.to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let (path, ct, got) = lock(&seen)[0].clone();
+        assert_eq!(path, "/v1/audio/transcriptions");
+        assert_eq!(ct, "multipart/form-data; boundary=B0");
+        assert_eq!(&got[..], body);
+        let entry = lock(&capture.0)[0].clone();
+        assert_eq!(entry.route, "transcriptions");
+        assert_eq!(entry.model, "whisper");
+        assert_eq!(entry.request["form"]["model"], "whisper");
+        assert_eq!(entry.request["files"][0]["filename"], "a.wav");
+        assert_eq!(entry.request["files"][0]["bytes"], 6);
+    }
+
+    #[tokio::test]
+    async fn model_list_keeps_upstream_metadata() {
+        let mut e = ep("vllm", 9001, &["m"]);
+        e.model_meta.insert(
+            "m".into(),
+            serde_json::json!({"id": "m", "object": "model", "owned_by": "vllm", "max_model_len": 8192, "created": 42}),
+        );
+        let url = serve_proxy(hive_with(vec![e], vec![]).await).await;
+        let list: Value = reqwest::get(format!("{url}/v1/models")).await.unwrap().json().await.unwrap();
+        let m = &list["data"][0];
+        assert_eq!(m["max_model_len"], 8192);
+        assert_eq!(m["created"], 42);
+        assert_eq!(m["owned_by"], "test"); // the member's name
+        assert!(m["hivllm"]["paths"].is_array());
+        let one: Value = reqwest::get(format!("{url}/v1/models/m")).await.unwrap().json().await.unwrap();
+        assert_eq!(one["max_model_len"], 8192);
+        assert_eq!(reqwest::get(format!("{url}/v1/models/nope")).await.unwrap().status(), 404);
     }
 }
