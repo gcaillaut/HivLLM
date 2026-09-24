@@ -11,6 +11,11 @@ and gathers them behind a **single endpoint**.
    - Scans `ss -tln` listening ports + `docker ps` published ports
      and probes each for `/v1/models`.
    - Re-scans every `--scan-interval` seconds (default 30).
+   - A backend that stops answering stays a member (last known models)
+     until it misses `--drop-after` scans in a row (default 3), so one
+     slow probe of a busy backend doesn't 404 its model; requests that hit
+     it meanwhile fail over. Answering backends are always taken as they
+     are now, and Docker containers leave as soon as they stop.
    - `ss` / `docker ps` run asynchronously with a 5s cap: a missing or
      wedged Docker daemon never stalls discovery.
 

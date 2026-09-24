@@ -79,6 +79,10 @@ pub struct Hive {
     /// pass finishing after a newer one would otherwise overwrite fresh
     /// membership with stale results.
     scan_lock: Arc<Mutex<()>>,
+    /// base_url → consecutive scans a member has been missing from.
+    missed_scans: Arc<StdMutex<HashMap<String, u32>>>,
+    /// Consecutive missed scans before a member leaves (1 = at once).
+    drop_after: u32,
     /// (model, effective load) -> next index. Equal effective loads rotate
     /// round-robin. All-idle degrades to plain round-robin.
     rr: Arc<Mutex<HashMap<(String, RankKey), usize>>>,
@@ -107,6 +111,8 @@ impl Hive {
             last_view: Arc::new(Mutex::new(String::new())),
             endpoints: Arc::new(RwLock::new(Vec::new())),
             scan_lock: Arc::new(Mutex::new(())),
+            missed_scans: Arc::new(StdMutex::new(HashMap::new())),
+            drop_after: DEFAULT_DROP_AFTER,
             rr: Arc::new(Mutex::new(HashMap::new())),
         }
     }
@@ -129,6 +135,12 @@ impl Hive {
     /// a long generation that keeps streaming is never cut off.
     pub fn with_timeouts(mut self, connect: Duration, read: Option<Duration>) -> Self {
         self.client = upstream_client(connect, read);
+        self
+    }
+
+    /// Consecutive failed scans before a member leaves the hive (min 1).
+    pub fn with_drop_after(mut self, scans: u32) -> Self {
+        self.drop_after = scans.max(1);
         self
     }
 
@@ -197,7 +209,42 @@ impl Hive {
     /// Install a freshly probed member list, minus anything that leads
     /// back into this hive (see [`Hive::without_self`]).
     pub async fn set_endpoints(&self, endpoints: Vec<DiscoveredEndpoint>) {
-        *self.endpoints.write().await = self.without_self(endpoints);
+        let fresh = self.without_self(endpoints);
+        let mut current = self.endpoints.write().await;
+        let kept = self.carry_over_missing(&current, &fresh);
+        let mut all = fresh;
+        all.extend(kept);
+        all.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+        *current = all;
+    }
+
+    /// Members absent from this scan that are kept anyway, with their last
+    /// known models, until they miss `drop_after` scans in a row: a busy
+    /// backend answering one `/v1/models` probe late must not vanish (and
+    /// 404 its model) until the next scan. Members that answered are
+    /// always taken as they are now. Docker members leave at once: the
+    /// Engine API is authoritative on whether a container runs.
+    fn carry_over_missing(
+        &self,
+        previous: &[DiscoveredEndpoint],
+        fresh: &[DiscoveredEndpoint],
+    ) -> Vec<DiscoveredEndpoint> {
+        let present: HashSet<&str> = fresh.iter().map(|e| e.base_url.as_str()).collect();
+        let mut missed = lock(&self.missed_scans);
+        missed.retain(|url, _| !present.contains(url.as_str()));
+        let mut kept = Vec::new();
+        for ep in previous.iter().filter(|e| !present.contains(e.base_url.as_str())) {
+            let n = missed.entry(ep.base_url.clone()).or_insert(0);
+            *n += 1;
+            if ep.source != "docker" && *n < self.drop_after {
+                tracing::debug!(base_url = %ep.base_url, missed = *n, "member missed a scan, kept");
+                kept.push(ep.clone());
+            } else {
+                tracing::info!(base_url = %ep.base_url, missed = *n, "member left the hive");
+                missed.remove(&ep.base_url);
+            }
+        }
+        kept
     }
 
     /// Drop what leads back into this hive:
@@ -688,6 +735,9 @@ fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
     }
     body.get("model")?.as_str().map(|s| s.to_string())
 }
+
+/// Default consecutive failed scans before a member leaves.
+pub const DEFAULT_DROP_AFTER: u32 = 3;
 
 /// Default largest request body: room for long contexts and a few
 /// base64 images.
@@ -2346,5 +2396,55 @@ mod tests {
         first.await.unwrap();
         second.await.unwrap();
         assert_eq!(hive.snapshot().await[0].models, vec!["new".to_string()]);
+    }
+
+    fn urls_of(eps: &[DiscoveredEndpoint]) -> Vec<String> {
+        eps.iter().map(|e| e.base_url.clone()).collect()
+    }
+
+    #[tokio::test]
+    async fn members_survive_a_few_missed_scans() {
+        let hive = Hive::new(0).with_drop_after(3);
+        let a = ep("a", 9001, &["m"]);
+        let b = ep("b", 9002, &["m"]);
+        hive.set_endpoints(vec![a.clone(), b.clone()]).await;
+        // `a` misses two scans: still a member, last known models intact.
+        for _ in 0..2 {
+            hive.set_endpoints(vec![b.clone()]).await;
+            assert_eq!(urls_of(&hive.snapshot().await), urls(&[9001, 9002]));
+        }
+        assert_eq!(hive.candidates("m").await.len(), 2);
+        // Third miss in a row: gone.
+        hive.set_endpoints(vec![b.clone()]).await;
+        assert_eq!(urls_of(&hive.snapshot().await), urls(&[9002]));
+    }
+
+    #[tokio::test]
+    async fn answering_resets_the_miss_count_and_updates_models() {
+        let hive = Hive::new(0).with_drop_after(2);
+        hive.set_endpoints(vec![ep("a", 9001, &["m"])]).await;
+        hive.set_endpoints(vec![]).await; // miss 1
+        // Answers again, now without "m": taken as-is, count reset.
+        hive.set_endpoints(vec![ep("a", 9001, &["other"])]).await;
+        assert_eq!(hive.snapshot().await[0].models, vec!["other".to_string()]);
+        hive.set_endpoints(vec![]).await; // miss 1 again, not 2
+        assert_eq!(hive.snapshot().await.len(), 1);
+        hive.set_endpoints(vec![]).await;
+        assert!(hive.snapshot().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn docker_members_and_drop_after_one_leave_at_once() {
+        let mut container = ep("c", 9001, &["m"]);
+        container.source = "docker".into();
+        let hive = Hive::new(0);
+        hive.set_endpoints(vec![container]).await;
+        hive.set_endpoints(vec![]).await;
+        assert!(hive.snapshot().await.is_empty());
+
+        let strict = Hive::new(0).with_drop_after(1);
+        strict.set_endpoints(vec![ep("a", 9001, &["m"])]).await;
+        strict.set_endpoints(vec![]).await;
+        assert!(strict.snapshot().await.is_empty());
     }
 }

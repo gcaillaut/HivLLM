@@ -82,6 +82,12 @@ struct Args {
     #[arg(long, default_value_t = 30)]
     scan_interval: u64,
 
+    /// Consecutive failed scans before a backend leaves the hive (1 = at
+    /// the first failure). Missing backends keep their last known models
+    /// meanwhile; Docker containers always leave at once.
+    #[arg(long, default_value_t = hive::DEFAULT_DROP_AFTER)]
+    drop_after: u32,
+
     /// Backend load poll interval in seconds for least-load routing
     /// (0 = disable polling, fall back to plain round-robin)
     #[arg(long, default_value_t = 5)]
@@ -202,6 +208,7 @@ async fn main() -> anyhow::Result<()> {
         .with_log_options(args.log_truncate, args.log_max_chars)
         .with_timeouts(Duration::from_secs(args.connect_timeout), read_timeout)
         .with_forward_auth(args.forward_auth)
+        .with_drop_after(args.drop_after)
         .with_max_body((args.max_body_mb > 0).then(|| args.max_body_mb.saturating_mul(1024 * 1024)));
     let hive = match args.hive_id {
         Some(id) if !hive::valid_hive_id(&id) => {
