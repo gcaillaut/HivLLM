@@ -400,14 +400,29 @@ pub trait LogSink: Send + Sync {
 
 /// Fan-out logger: every entry goes to every sink. Cheap to clone,
 /// no-op when no sinks are configured.
+///
+/// With [`RequestLogger::spawn_writer`], entries are queued and written
+/// by a background task, so serialising and writing a full payload never
+/// delays a response. Nothing is dropped: a full queue makes `log` wait.
+/// Without it, `log` writes inline.
 #[derive(Clone, Default)]
 pub struct RequestLogger {
     sinks: Vec<Arc<dyn LogSink>>,
+    queue: Option<tokio::sync::mpsc::Sender<LogMsg>>,
 }
+
+enum LogMsg {
+    Entry(Box<LogEntry>),
+    /// Answered once every entry queued before it is written.
+    Flush(oneshot::Sender<()>),
+}
+
+/// Entries buffered before `log` starts waiting for the writer.
+const LOG_QUEUE: usize = 4096;
 
 impl RequestLogger {
     pub fn new() -> Self {
-        Self { sinks: Vec::new() }
+        Self::default()
     }
 
     pub fn with_sink(mut self, sink: Arc<dyn LogSink>) -> Self {
@@ -415,9 +430,53 @@ impl RequestLogger {
         self
     }
 
+    /// Move writing to a background task (call after adding sinks).
+    pub fn spawn_writer(mut self) -> Self {
+        if self.sinks.is_empty() {
+            return self;
+        }
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<LogMsg>(LOG_QUEUE);
+        let sinks = self.sinks.clone();
+        tokio::spawn(async move {
+            while let Some(msg) = rx.recv().await {
+                match msg {
+                    LogMsg::Entry(entry) => {
+                        for sink in &sinks {
+                            sink.emit((*entry).clone()).await;
+                        }
+                    }
+                    LogMsg::Flush(done) => {
+                        let _ = done.send(());
+                    }
+                }
+            }
+        });
+        self.queue = Some(tx);
+        self
+    }
+
     pub async fn log(&self, entry: LogEntry) {
-        for sink in &self.sinks {
-            sink.emit(entry.clone()).await;
+        match &self.queue {
+            Some(tx) => {
+                if tx.send(LogMsg::Entry(Box::new(entry))).await.is_err() {
+                    tracing::warn!("query log writer gone, entry lost");
+                }
+            }
+            None => {
+                for sink in &self.sinks {
+                    sink.emit(entry.clone()).await;
+                }
+            }
+        }
+    }
+
+    /// Wait until every entry logged so far is written.
+    pub async fn flush(&self) {
+        if let Some(tx) = &self.queue {
+            let (done, wait) = oneshot::channel();
+            if tx.send(LogMsg::Flush(done)).await.is_ok() {
+                let _ = wait.await;
+            }
         }
     }
 
@@ -910,5 +969,35 @@ mod tests {
         assert_eq!(a.tag_of("other.20260924T101500.123Z.jsonl"), None);
         let bare = ArchiveName::new("queries");
         assert_eq!(bare.tag_of("queries.20260924T101500.123Z.gz"), Some("20260924T101500.123Z"));
+    }
+
+    /// Sink that takes its time, recording what it got.
+    struct SlowSink(std::time::Duration, Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl LogSink for SlowSink {
+        fn name(&self) -> &'static str {
+            "slow"
+        }
+        fn emit<'a>(&'a self, entry: LogEntry) -> BoxFuture<'a, ()> {
+            Box::pin(async move {
+                tokio::time::sleep(self.0).await;
+                self.1.lock().unwrap().push(entry.model);
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn background_writer_keeps_logging_off_the_request_path() {
+        let got = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let slow = SlowSink(std::time::Duration::from_millis(300), got.clone());
+        let logger = RequestLogger::new().with_sink(Arc::new(slow)).spawn_writer();
+        let start = std::time::Instant::now();
+        logger.log(entry("a")).await;
+        logger.log(entry("b")).await;
+        assert!(start.elapsed() < std::time::Duration::from_millis(200));
+        assert!(got.lock().unwrap().is_empty());
+        // Flush waits for everything queued before it, in order.
+        logger.flush().await;
+        assert_eq!(*got.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
     }
 }

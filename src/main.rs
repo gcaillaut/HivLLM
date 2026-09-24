@@ -200,8 +200,9 @@ async fn main() -> anyhow::Result<()> {
             compress = args.log_compress,
             "🐝 query log enabled"
         );
-        RequestLogger::new().with_sink(sink)
+        RequestLogger::new().with_sink(sink).spawn_writer()
     };
+    let log_queue = logger.clone();
     let read_timeout = (args.read_timeout > 0).then(|| Duration::from_secs(args.read_timeout));
     let hive = Hive::new(args.port)
         .with_logger(logger)
@@ -297,8 +298,38 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!("   POST /v1/embeddings        (route by `model`)");
 
     let listener = tokio::net::TcpListener::bind(addr).await?;
-    axum::serve(listener, app).await?;
+    axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await?;
+    // In-flight requests are done; their log entries (streams log from a
+    // task woken as the body ends) get a moment to queue, then land on disk.
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    log_queue.flush().await;
+    tracing::info!("🐝 hive stopped, query log flushed");
     Ok(())
+}
+
+/// Ctrl-C, or SIGTERM (`docker stop`) on Unix.
+async fn shutdown_signal() {
+    let ctrl_c = async {
+        let _ = tokio::signal::ctrl_c().await;
+    };
+    #[cfg(unix)]
+    let term = async {
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(_) => std::future::pending::<()>().await,
+        }
+    };
+    #[cfg(not(unix))]
+    let term = std::future::pending::<()>();
+    tokio::select! {
+        _ = ctrl_c => {},
+        _ = term => {},
+    }
+    tracing::info!("🐝 shutting down: finishing in-flight requests");
 }
 
 /// All routes, behind API-key auth (when a key is set) and CORS (outermost,

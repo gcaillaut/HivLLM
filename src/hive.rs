@@ -500,6 +500,8 @@ impl Hive {
         let Some(path) = self.logger.file_sink_path() else {
             return Vec::new();
         };
+        // Show everything logged so far, including the caller's last query.
+        self.logger.flush().await;
         read_recent(&path, limit).await
     }
 

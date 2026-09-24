@@ -216,6 +216,11 @@ Cap entry size with a truncation strategy:
 cargo run -- --log-truncate chars --log-max-chars 500
 ```
 
+Entries are written by a background task, so logging never delays a
+response (nothing is dropped: a full queue makes requests wait). On
+Ctrl-C / SIGTERM (`docker stop`) the hive finishes in-flight requests
+and flushes the log before exiting.
+
 Adding a sink (YAML file, Langfuse, Logfire, …) means implementing the
 `LogSink` trait in `src/logging.rs` and wiring it in `main.rs` —
 the proxy code doesn't change.
