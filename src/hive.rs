@@ -28,7 +28,7 @@ use crate::discovery::{
 use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
 use crate::logging::{
-    extract_response, read_recent, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
+    extract_response, read_recent, truncate_text, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
     StreamSummary, TeeStream, Truncate,
 };
 
@@ -675,6 +675,21 @@ fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
     body.get("model")?.as_str().map(|s| s.to_string())
 }
 
+/// Upstream statuses worth another candidate: the backend is rate
+/// limiting (429), broken (500), a bad gateway — e.g. a downstream hive's
+/// `loop detected` — (502), or unavailable / still loading (503). Never
+/// 504 (the generation may still be running downstream) nor other 4xx
+/// (the client's mistake, every backend would repeat it).
+fn retryable(status: StatusCode) -> bool {
+    matches!(
+        status,
+        StatusCode::TOO_MANY_REQUESTS
+            | StatusCode::INTERNAL_SERVER_ERROR
+            | StatusCode::BAD_GATEWAY
+            | StatusCode::SERVICE_UNAVAILABLE
+    )
+}
+
 /// Most routes advertised per model: shortest first, so a dense mesh
 /// can't blow up the model list.
 const MAX_ADVERTISED_PATHS: usize = 8;
@@ -1005,7 +1020,8 @@ async fn proxy_by_model(
     // over: the backend accepted the request and may still be generating,
     // so retrying elsewhere would run the same generation twice.
     let mut last_error = String::new();
-    for upstream in &candidates {
+    for (attempt, upstream) in candidates.iter().enumerate() {
+        let is_last = attempt + 1 == candidates.len();
         let url = join_upstream_path(upstream, upstream_path);
         let mut req = hive
             .client
@@ -1058,6 +1074,19 @@ async fn proxy_by_model(
 
         let status = StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
+
+        // Overloaded / broken / unavailable backends produced nothing:
+        // try the next candidate. The last one's answer is passed through
+        // as-is, so the client sees the real error.
+        if !is_last && retryable(status) {
+            let detail = truncate_text(&resp.text().await.unwrap_or_default(), 300);
+            tracing::warn!(%url, %status, %detail, "upstream error, trying next hive member");
+            if matches!(status, StatusCode::SERVICE_UNAVAILABLE | StatusCode::TOO_MANY_REQUESTS) {
+                hive.mark_failed(upstream);
+            }
+            last_error = format!("`{upstream}` answered {status}: {detail}");
+            continue;
+        }
 
         if stream_mode {
             // Tee the SSE bytes: client streams untouched while we rebuild the
@@ -1162,9 +1191,9 @@ async fn proxy_by_model(
         return (status, resp_headers, body_from_bytes(bytes)).into_response();
     }
 
-    // Every candidate failed to accept the request.
+    // Every candidate failed (the last one at the transport level).
     let msg = format!(
-        "all {} hive member(s) unreachable for model `{model}`: {last_error}",
+        "no hive member could serve model `{model}` ({} tried), last error: {last_error}",
         candidates.len()
     );
     log_query(
@@ -2050,5 +2079,109 @@ mod tests {
             .map(|i| hive_member(&format!("h{i}"), vec![vec![&format!("h{i}")]]))
             .collect();
         assert_eq!(Hive::advertised_paths(&many, "m", &avoid).len(), MAX_ADVERTISED_PATHS);
+    }
+
+    /// Mock backend answering every completion with `status` (an error
+    /// body unless 200; SSE when the request streams). Counts hits.
+    async fn status_backend(status: u16) -> (u16, Arc<std::sync::atomic::AtomicUsize>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let h = hits.clone();
+        let mock = Router::new().route(
+            "/v1/chat/completions",
+            post(move |Json(body): Json<Value>| {
+                let h = h.clone();
+                async move {
+                    h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let code = StatusCode::from_u16(status).unwrap();
+                    if status != 200 {
+                        let err = serde_json::json!({"error": {"message": format!("mock {status}")}});
+                        return (code, Json(err)).into_response();
+                    }
+                    if body["stream"] == true {
+                        let sse = "data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\ndata: [DONE]\n\n";
+                        return ([("content-type", "text/event-stream")], sse).into_response();
+                    }
+                    Json(serde_json::json!({"id": "ok", "choices": []})).into_response()
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        (port, hits)
+    }
+
+    /// Hive over `first` (ranked first by load) then `second`.
+    async fn two_backends(first: u16, second: u16) -> Hive {
+        hive_with(
+            vec![ep("first", first, &["m"]), ep("second", second, &["m"])],
+            vec![(("first", "m"), Load::Known(1)), (("second", "m"), Load::Known(5))],
+        )
+        .await
+    }
+
+    async fn chat(url: &str, stream: bool) -> reqwest::Response {
+        reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "m", "messages": [], "stream": stream}))
+            .send()
+            .await
+            .unwrap()
+    }
+
+    fn hits(n: &std::sync::atomic::AtomicUsize) -> usize {
+        n.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[tokio::test]
+    async fn retryable_errors_fail_over_to_the_next_backend() {
+        for (code, cools) in [(503, true), (429, true), (500, false), (502, false)] {
+            let (bad, bad_hits) = status_backend(code).await;
+            let (good, good_hits) = status_backend(200).await;
+            let hive = two_backends(bad, good).await;
+            let url = serve_proxy(hive.clone()).await;
+            let resp = chat(&url, false).await;
+            assert_eq!(resp.status(), 200, "{code}");
+            assert_eq!((hits(&bad_hits), hits(&good_hits)), (1, 1), "{code}");
+            // Overload signals rank the backend last; request-specific
+            // errors don't.
+            let order = hive.candidates("m").await;
+            let bad_first = order[0] == format!("http://127.0.0.1:{bad}");
+            assert_eq!(!bad_first, cools, "{code}: {order:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn streams_fail_over_before_any_byte_is_sent() {
+        let (bad, _) = status_backend(503).await;
+        let (good, _) = status_backend(200).await;
+        let url = serve_proxy(two_backends(bad, good).await).await;
+        let resp = chat(&url, true).await;
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().await.unwrap().contains("\"ok\""));
+    }
+
+    #[tokio::test]
+    async fn client_errors_and_gateway_timeouts_are_not_retried() {
+        for code in [400, 404, 504] {
+            let (bad, _) = status_backend(code).await;
+            let (good, good_hits) = status_backend(200).await;
+            let url = serve_proxy(two_backends(bad, good).await).await;
+            let resp = chat(&url, false).await;
+            assert_eq!(resp.status().as_u16(), code);
+            assert_eq!(hits(&good_hits), 0, "{code} must not be retried");
+        }
+    }
+
+    #[tokio::test]
+    async fn last_candidate_error_is_passed_through() {
+        let (a, a_hits) = status_backend(503).await;
+        let (b, b_hits) = status_backend(500).await;
+        let url = serve_proxy(two_backends(a, b).await).await;
+        let resp = chat(&url, false).await;
+        assert_eq!(resp.status(), 500);
+        let body: Value = resp.json().await.unwrap();
+        assert_eq!(body["error"]["message"], "mock 500");
+        assert_eq!((hits(&a_hits), hits(&b_hits)), (1, 1));
     }
 }

@@ -24,10 +24,15 @@ and gathers them behind a **single endpoint**.
       `--enable-server-load-tracking` server-side) — and requests go to
       the lowest *effective* load: `max(server_load, hive-observed
       in-flight requests)` (requests count as in flight from the moment
-      they are sent). Ties round-robin; unreachable backends fail over to
-      the next candidate and are ranked last for 15s, so a dead backend
-      stops looking idle. A backend that times out is answered `504`, not
-      retried elsewhere (it may still be generating).
+      they are sent). Ties round-robin. Unreachable backends, and backends
+      answering `429`/`500`/`502`/`503` (overloaded, broken, still loading,
+      a downstream hive's `loop detected`), fail over to the next candidate
+      — streams included, since the status arrives before any byte is
+      sent. Unreachable, `429` and `503` backends are also ranked last for
+      15s, so they stop looking idle. The last candidate's error is passed
+      through as-is. Other `4xx` are never retried (every backend would
+      repeat them), nor timeouts / `504` (the generation may still be
+      running).
     - Stdout shows the same numbers the balancer uses, per model:
       positive server reports as `load=N`, anything unverified as
       `load=~N` (unknown backends, or a `0` that could equally mean idle
