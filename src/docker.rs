@@ -98,15 +98,16 @@ impl DockerDiscovery {
                 async move {
                     for port in ports {
                         let base_url = format!("http://{name}:{port}");
-                        if let Some(models) =
+                        if let Some(probed) =
                             probe_openai_endpoint(&client, &base_url).await
                         {
                             return Some(DiscoveredEndpoint {
                                 id: format!("docker-{name}-{port}"),
                                 name: name.clone(),
                                 base_url,
-                                models,
+                                models: probed.models,
                                 source: "docker".to_string(),
+                                hive_id: probed.hive_id,
                             });
                         }
                     }

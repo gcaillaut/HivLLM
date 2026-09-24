@@ -24,6 +24,22 @@ pub struct DiscoveredEndpoint {
     pub models: Vec<String>,
     /// Where we found it: "well-known-port" | "ss-listener" | "docker" | "manual"
     pub source: String,
+    /// Set when the backend is itself a HivLLM hive: its instance id
+    /// (`x-hivllm-id` response header), as it appears on Via paths.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hive_id: Option<String>,
+}
+
+/// Response header every hive stamps with its instance id, so peers can
+/// recognise it whatever address they reach it by.
+pub const HIVE_ID_HEADER: &str = "x-hivllm-id";
+
+/// A successful `/v1/models` probe.
+#[derive(Debug, Clone)]
+pub struct Probed {
+    pub models: Vec<String>,
+    /// Instance id when the backend is a hive.
+    pub hive_id: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -95,11 +111,9 @@ pub fn join_upstream_path(base_url: &str, api_path: &str) -> String {
     }
 }
 
-/// Probe a single base URL for OpenAI compat. Returns model ids on success.
-pub async fn probe_openai_endpoint(
-    client: &reqwest::Client,
-    base_url: &str,
-) -> Option<Vec<String>> {
+/// Probe a single base URL for OpenAI compat. Returns model ids (and the
+/// hive id, for hives) on success.
+pub async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Option<Probed> {
     let url = models_url(base_url);
     let resp = client
         .get(&url)
@@ -110,11 +124,16 @@ pub async fn probe_openai_endpoint(
     if !resp.status().is_success() {
         return None;
     }
+    let hive_id = resp
+        .headers()
+        .get(HIVE_ID_HEADER)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
     let body: ModelList = resp.json().await.ok()?;
     let mut models: Vec<String> = body.data.into_iter().map(|m| m.id).collect();
     models.sort();
     models.dedup();
-    Some(models)
+    Some(Probed { models, hive_id })
 }
 
 /// `ss -tln` listening TCP ports (Linux). Falls back to empty on error.
@@ -244,7 +263,7 @@ pub async fn discover(
             let docker_ports = &docker_ports;
             async move {
                 let base_url = format!("http://127.0.0.1:{port}");
-                let models = probe_openai_endpoint(client, &base_url).await?;
+                let probed = probe_openai_endpoint(client, &base_url).await?;
                 let source = if docker_ports.contains(&port) {
                     "docker"
                 } else if well_known_ports(&[]).contains(&port) {
@@ -256,8 +275,9 @@ pub async fn discover(
                     id: format!("http-127.0.0.1-{port}"),
                     name: proc_hint(port, proc_map),
                     base_url,
-                    models,
+                    models: probed.models,
                     source: source.to_string(),
+                    hive_id: probed.hive_id,
                 })
             }
         })
@@ -304,8 +324,8 @@ pub async fn probe_static(
             let client = client.clone();
             async move {
                 let base_url = normalize_base_url(&raw);
-                let models = match probe_openai_endpoint(&client, &base_url).await {
-                    Some(m) => m,
+                let probed = match probe_openai_endpoint(&client, &base_url).await {
+                    Some(p) => p,
                     None => {
                         tracing::warn!(%base_url, "static backend unreachable, skipping");
                         return None;
@@ -323,8 +343,9 @@ pub async fn probe_static(
                     id,
                     name: host,
                     base_url,
-                    models,
+                    models: probed.models,
                     source: "static".to_string(),
+                    hive_id: probed.hive_id,
                 })
             }
         })
@@ -355,6 +376,9 @@ pub fn merge_endpoints(
                 existing.models.sort();
                 if ep.source == "static" {
                     existing.source = "static".to_string();
+                }
+                if existing.hive_id.is_none() {
+                    existing.hive_id = ep.hive_id;
                 }
             }
             None => {
@@ -407,6 +431,7 @@ mod tests {
                 base_url: url.into(),
                 models: models.iter().map(|s| s.to_string()).collect(),
                 source: source.into(),
+                hive_id: None,
             }
         }
         let out = merge_endpoints(

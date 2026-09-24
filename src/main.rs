@@ -22,7 +22,6 @@ use axum::{
     http::{header, HeaderValue, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
-    routing::{get, post},
     Router,
 };
 use clap::{Parser, ValueEnum};
@@ -141,6 +140,12 @@ struct Args {
     #[arg(long)]
     forward_auth: bool,
 
+    /// Instance id stamped on responses and Via paths, so peer hives
+    /// recognise this one whatever address they use. Random by default;
+    /// pin it for stable ids in logs. No commas.
+    #[arg(long)]
+    hive_id: Option<String>,
+
     /// CORS allowed origins for browser UIs: "local" = pages served from
     /// localhost / 127.0.0.1 / [::1] on any port; "*" = any site (lets any
     /// web page you visit read the query log); a comma-separated origin
@@ -192,6 +197,13 @@ async fn main() -> anyhow::Result<()> {
         .with_log_options(args.log_truncate, args.log_max_chars)
         .with_timeouts(Duration::from_secs(args.connect_timeout), read_timeout)
         .with_forward_auth(args.forward_auth);
+    let hive = match args.hive_id {
+        Some(id) if !hive::valid_hive_id(&id) => {
+            return Err(format!("invalid --hive-id {id:?}: printable ASCII, no spaces or commas").into());
+        }
+        Some(id) => hive.with_hive_id(id),
+        None => hive,
+    };
 
     // Docker socket discovery (opt-in): containers labeled
     // `hivllm.enable=true` join the hive; lifecycle events refresh it.
@@ -261,10 +273,11 @@ async fn main() -> anyhow::Result<()> {
     if args.api_key.is_empty() && !args.bind.is_loopback() {
         tracing::warn!(bind = %args.bind, "hive exposed without --api-key: anyone who can reach it can use every model and read the query log");
     }
+    let hive_id = hive.own_id();
     let app = build_router(hive, &args.cors_origin, &args.api_key);
 
     let addr = SocketAddr::from((args.bind, args.port));
-    tracing::info!("🐝 HivLLM hive listening on http://{addr}");
+    tracing::info!("🐝 HivLLM hive {} listening on http://{addr}", hive_id);
     tracing::info!("   GET  /v1/models");
     tracing::info!("   POST /v1/chat/completions  (route by `model`)");
     tracing::info!("   POST /v1/completions       (route by `model`)");
@@ -278,17 +291,7 @@ async fn main() -> anyhow::Result<()> {
 /// All routes, behind API-key auth (when a key is set) and CORS (outermost,
 /// so preflights are answered before auth).
 fn build_router(hive: Hive, cors_origin: &str, api_key: &str) -> Router {
-    let mut app = Router::new()
-        .route("/health", get(hive::health))
-        .route("/load", get(hive::server_load))
-        .route("/v1/models", get(hive::list_models))
-        .route("/v1/chat/completions", post(hive::chat_completions))
-        .route("/v1/completions", post(hive::completions))
-        .route("/v1/embeddings", post(hive::embeddings))
-        .route("/api/hive/endpoints", get(hive::list_endpoints))
-        .route("/api/hive/backends", get(hive::list_backends))
-        .route("/api/hive/queries", get(hive::list_queries))
-        .with_state(hive);
+    let mut app = hive::routes(hive);
 
     if !api_key.is_empty() {
         let expected: Arc<[u8]> = format!("Bearer {api_key}").into_bytes().into();

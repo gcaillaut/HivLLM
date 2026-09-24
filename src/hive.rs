@@ -23,6 +23,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::discovery::{
     discover, join_upstream_path, merge_endpoints, probe_static, DiscoveredEndpoint,
+    HIVE_ID_HEADER,
 };
 use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
@@ -39,7 +40,10 @@ pub struct Hive {
     pub client: reqwest::Client,
     /// Port the hive itself listens on — always excluded from discovery.
     own_port: u16,
-    /// This hive's id on the Via path (its served base_url).
+    /// This hive's instance id: stamped on every response
+    /// (`x-hivllm-id`) and appended to the Via path of forwarded requests.
+    /// Unique per process unless pinned with `--hive-id`, so peers
+    /// recognise this hive whatever address they reach it by.
     own_id: String,
     logger: RequestLogger,
     log_truncate: Truncate,
@@ -78,7 +82,7 @@ impl Hive {
         Self {
             client: upstream_client(DEFAULT_CONNECT_TIMEOUT, Some(DEFAULT_READ_TIMEOUT)),
             own_port,
-            own_id: format!("http://127.0.0.1:{own_port}"),
+            own_id: new_hive_id(),
             logger: RequestLogger::new(),
             log_truncate: Truncate::None,
             log_max_chars: 2000,
@@ -103,8 +107,9 @@ impl Hive {
         self
     }
 
-    /// Override the Via id (tests serve on ephemeral ports).
-    pub fn with_own_id(mut self, id: String) -> Self {
+    /// Pin the instance id (`--hive-id`). Must be a valid header value
+    /// without commas (Via paths are comma-separated).
+    pub fn with_hive_id(mut self, id: String) -> Self {
         self.own_id = id;
         self
     }
@@ -151,15 +156,31 @@ impl Hive {
             let docked = d.container_backends(&self.client).await;
             all = merge_endpoints(all, docked);
         }
-        *self.endpoints.write().await = all;
+        *self.endpoints.write().await = self.without_self(all);
+    }
+
+    /// Drop endpoints that are this very hive reached by another address
+    /// (a static URL, a LAN IP, a container name): the own-port exclusion
+    /// only covers localhost discovery.
+    fn without_self(&self, endpoints: Vec<DiscoveredEndpoint>) -> Vec<DiscoveredEndpoint> {
+        endpoints
+            .into_iter()
+            .filter(|ep| {
+                let is_self = ep.hive_id.as_deref() == Some(self.own_id.as_str());
+                if is_self {
+                    tracing::debug!(base_url = %ep.base_url, "skipping endpoint: it is this hive");
+                }
+                !is_self
+            })
+            .collect()
     }
 
     pub async fn snapshot(&self) -> Vec<DiscoveredEndpoint> {
         self.endpoints.read().await.clone()
     }
 
-    /// This hive's own id on the Via path (same shape as member base_urls).
-    fn own_id(&self) -> String {
+    /// This hive's instance id (see [`Hive::with_hive_id`]).
+    pub fn own_id(&self) -> String {
         self.own_id.clone()
     }
 
@@ -468,18 +489,30 @@ impl Hive {
         out
     }
 
-    /// [`Hive::candidates`] minus already-visited backends. A request that
-    /// arrives with every backend on its Via path is a loop — the proxy
-    /// answers 502 instead of forwarding forever.
+    /// [`Hive::candidates`] minus already-visited backends: hives whose id
+    /// is on the Via path (or, from pre-id hives, whose base_url is). A
+    /// request that arrives with every backend visited is a loop — the
+    /// proxy answers 502 instead of forwarding forever.
     pub async fn candidates_excluding(
         &self,
         model: &str,
         visited: &HashSet<String>,
     ) -> Vec<String> {
+        let excluded: HashSet<String> = self
+            .endpoints
+            .read()
+            .await
+            .iter()
+            .filter(|ep| {
+                visited.contains(&ep.base_url)
+                    || ep.hive_id.as_ref().is_some_and(|id| visited.contains(id))
+            })
+            .map(|ep| ep.base_url.clone())
+            .collect();
         self.candidates(model)
             .await
             .into_iter()
-            .filter(|u| !visited.contains(u))
+            .filter(|u| !excluded.contains(u))
             .collect()
     }
 }
@@ -574,6 +607,50 @@ fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
     body.get("model")?.as_str().map(|s| s.to_string())
 }
 
+/// Random instance id: unique per process (the std hasher is seeded from
+/// OS randomness), so two hives never share one even on the same port.
+fn new_hive_id() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    h.write_u128(nanos);
+    h.write_u32(std::process::id());
+    format!("hive-{:016x}", h.finish())
+}
+
+/// Whether `id` can be a hive id: a header value that can't be confused
+/// with Via-path separators.
+pub fn valid_hive_id(id: &str) -> bool {
+    !id.is_empty() && id.chars().all(|c| c.is_ascii_graphic() && c != ',')
+}
+
+/// Every hive route, each response stamped with this hive's id.
+pub fn routes(hive: Hive) -> axum::Router {
+    use axum::routing::{get, post};
+    let id = axum::http::HeaderValue::from_str(&hive.own_id).expect("valid hive id");
+    axum::Router::new()
+        .route("/health", get(health))
+        .route("/load", get(server_load))
+        .route("/v1/models", get(list_models))
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/completions", post(completions))
+        .route("/v1/embeddings", post(embeddings))
+        .route("/api/hive/endpoints", get(list_endpoints))
+        .route("/api/hive/backends", get(list_backends))
+        .route("/api/hive/queries", get(list_queries))
+        .with_state(hive)
+        .layer(axum::middleware::map_response(move |mut resp: Response| {
+            let id = id.clone();
+            async move {
+                resp.headers_mut().insert(HIVE_ID_HEADER, id);
+                resp
+            }
+        }))
+}
+
 /// Upstream connect timeout default: a dead host fails over in seconds.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
 /// Upstream read (idle) timeout default. Non-streaming backends stay
@@ -618,8 +695,8 @@ fn json_error(status: StatusCode, message: String) -> Response {
     (status, Json(payload)).into_response()
 }
 
-/// Request header carrying the comma-separated ids (`base_url`s) of hives
-/// that already forwarded this request. A hive never forwards to a backend
+/// Request header carrying the comma-separated instance ids of hives that
+/// already forwarded this request. A hive never forwards to a backend
 /// already on the path — this is what stops hive-of-hives ping-pong
 /// (A strictly prefers B while B strictly prefers A) from looping forever.
 pub const VIA_HEADER: &str = "x-hivllm-via";
@@ -1090,6 +1167,7 @@ mod tests {
             base_url: format!("http://127.0.0.1:{port}"),
             models: models.iter().map(|s| s.to_string()).collect(),
             source: "test".into(),
+            hive_id: None,
         }
     }
 
@@ -1453,6 +1531,7 @@ mod tests {
                 base_url: base_url.to_string(),
                 models: models.iter().map(|s| s.to_string()).collect(),
                 source: "test".into(),
+                hive_id: None,
             }
         }
 
@@ -1679,47 +1758,37 @@ mod tests {
 
     #[tokio::test]
     async fn hive_ping_pong_terminates_with_loop_detected() {
-        // Two hives that strictly prefer each other: without Via filtering
-        // this would bounce forever. A forwards to B with Via:[A], B finds
-        // only visited candidates and answers 502 — the client gets a fast
-        // error, not a hang.
-        async fn serve_hive(
-            listener: tokio::net::TcpListener,
-            hive: Hive,
-        ) -> String {
-            let url = format!("http://{}", listener.local_addr().unwrap());
-            let app = Router::new()
-                .route("/v1/chat/completions", post(chat_completions))
-                .with_state(hive);
-            tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-            url
-        }
-        fn member(id: &str, base_url: &str) -> DiscoveredEndpoint {
-            DiscoveredEndpoint {
-                id: id.to_string(),
-                name: "hive".into(),
-                base_url: base_url.to_string(),
-                models: vec!["m".to_string()],
-                source: "test".into(),
-            }
-        }
-
+        // Two hives that strictly prefer each other, each reaching the other
+        // by an address unrelated to its id (`localhost` here, a LAN name
+        // across hosts). Ids are learned by probing, as in production.
+        // A forwards to B with Via:[A]; B's only candidate is A, already
+        // visited, so B answers 502 — a fast error, not an endless loop.
         let la = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url_a = format!("http://{}", la.local_addr().unwrap());
         let lb = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url_b = format!("http://{}", lb.local_addr().unwrap());
-
-        let ha = Hive::new(0).with_own_id(url_a.clone());
-        *ha.endpoints.write().await = vec![member("b", &url_b)];
-        *ha.loads.write().await =
-            HashMap::from([(("b".to_string(), "m".to_string()), Load::Known(0))]);
-        serve_hive(la, ha).await;
-
-        let hb = Hive::new(0).with_own_id(url_b.clone());
-        *hb.endpoints.write().await = vec![member("a", &url_a)];
-        *hb.loads.write().await =
-            HashMap::from([(("a".to_string(), "m".to_string()), Load::Known(0))]);
-        serve_hive(lb, hb).await;
+        let url_a = format!("http://localhost:{}", la.local_addr().unwrap().port());
+        let url_b = format!("http://localhost:{}", lb.local_addr().unwrap().port());
+        let (ha, hb) = (Hive::new(0), Hive::new(0));
+        assert_ne!(ha.own_id(), hb.own_id());
+        for (l, h) in [(la, ha.clone()), (lb, hb.clone())] {
+            let app = routes(h);
+            tokio::spawn(async move { axum::serve(l, app).await.unwrap() });
+        }
+        // Both advertise model "m" through a local stub member so each has
+        // something to list; the stubs are then swapped for the peer.
+        let stub = |h: &Hive| {
+            let h = h.clone();
+            async move {
+                *h.endpoints.write().await = vec![ep("stub", 1, &["m"])];
+            }
+        };
+        stub(&ha).await;
+        stub(&hb).await;
+        let peer_b = probe_static(&ha.client, std::slice::from_ref(&url_b)).await;
+        let peer_a = probe_static(&hb.client, std::slice::from_ref(&url_a)).await;
+        assert_eq!(peer_b[0].hive_id.as_deref(), Some(hb.own_id().as_str()));
+        assert_eq!(peer_a[0].hive_id.as_deref(), Some(ha.own_id().as_str()));
+        *ha.endpoints.write().await = peer_b;
+        *hb.endpoints.write().await = peer_a;
 
         let client = reqwest::Client::builder()
             .timeout(Duration::from_secs(10))
@@ -1740,5 +1809,28 @@ mod tests {
                 .contains("loop detected"),
             "{body}"
         );
+    }
+
+    #[tokio::test]
+    async fn hive_drops_itself_when_reached_by_another_address() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hive = hive_with(vec![ep("stub", 1, &["m"])], vec![]).await;
+        let app = routes(hive.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        // e.g. `--static-backends http://localhost:8335` on the hive itself.
+        let found = probe_static(&hive.client, &[format!("http://localhost:{port}")]).await;
+        assert_eq!(found.len(), 1);
+        assert!(hive.without_self(found).is_empty());
+    }
+
+    #[test]
+    fn hive_ids_are_unique_and_valid() {
+        let (a, b) = (new_hive_id(), new_hive_id());
+        assert_ne!(a, b);
+        assert!(valid_hive_id(&a));
+        assert!(!valid_hive_id("a,b"));
+        assert!(!valid_hive_id("a b"));
+        assert!(!valid_hive_id(""));
     }
 }

@@ -38,10 +38,15 @@ and gathers them behind a **single endpoint**.
      per model when `?model=` is given, global otherwise. Unverified
      aggregates are marked inexact and never trusted downstream, so a
      stale number can't circulate hive-to-hive as fact (approximations
-     are always recomputed locally, never forwarded as exact). Forwarded requests
-     carry an `x-hivllm-via` path and are never sent back to a visited
-     hive — mutual preferences can't ping-pong forever (answer is 502
-     `loop detected` instead).
+     are always recomputed locally, never forwarded as exact). Every hive stamps its
+     responses with a unique instance id (`x-hivllm-id`, random per
+     process, pin it with `--hive-id`), which discovery records for members
+     that are hives. Forwarded requests carry the ids of the hives they
+     went through (`x-hivllm-via`) and are never sent back to a visited
+     hive, whatever address it is known by — mutual preferences can't
+     ping-pong forever, across hosts too (answer is 502 `loop detected`
+     instead). A hive that discovers itself under another address (static
+     URL, LAN IP, container name) skips that endpoint.
    - Streaming (`"stream": true`) SSE is passed through.
 
 3. **Ops**
