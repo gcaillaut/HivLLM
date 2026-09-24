@@ -22,7 +22,7 @@ use std::{
 use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::discovery::{
-    discover, join_upstream_path, merge_endpoints, probe_static, DiscoveredEndpoint,
+    discover, join_upstream_path, merge_endpoints, probe_static, Credentials, DiscoveredEndpoint,
     HivModelMeta, HIVE_ID_HEADER, VIA_HEADER,
 };
 use crate::docker::DockerDiscovery;
@@ -70,6 +70,9 @@ pub struct Hive {
     /// Forward the client's `Authorization` header to backends (opt-in:
     /// by default a token never leaves the hive).
     forward_auth: bool,
+    /// Per-backend API keys (config file). A backend's own key always
+    /// wins over a forwarded client token.
+    credentials: Arc<Credentials>,
     /// Largest accepted request body (`None` = unlimited). Axum's 2 MB
     /// default rejects long contexts and base64 images.
     max_body: Option<usize>,
@@ -106,6 +109,7 @@ impl Hive {
             inflight: Arc::new(StdMutex::new(HashMap::new())),
             cooldown: Arc::new(StdMutex::new(HashMap::new())),
             forward_auth: false,
+            credentials: Arc::new(Credentials::default()),
             max_body: Some(DEFAULT_MAX_BODY),
             last_view: Arc::new(Mutex::new(String::new())),
             endpoints: Arc::new(RwLock::new(Vec::new())),
@@ -148,6 +152,11 @@ impl Hive {
         self
     }
 
+    pub fn with_credentials(mut self, credentials: Credentials) -> Self {
+        self.credentials = Arc::new(credentials);
+        self
+    }
+
     pub fn with_forward_auth(mut self, forward: bool) -> Self {
         self.forward_auth = forward;
         self
@@ -175,17 +184,18 @@ impl Hive {
         docker: Option<&DockerDiscovery>,
     ) {
         let me = self.own_id.as_str();
+        let creds = self.credentials.as_ref();
         let own_port = [self.own_port];
         self.scan_and_install(async {
             let docked = async {
                 match docker {
-                    Some(d) => d.container_backends(&self.client, me).await,
+                    Some(d) => d.container_backends(&self.client, me, creds).await,
                     None => Vec::new(),
                 }
             };
             let (found, pinned, docked) = tokio::join!(
-                discover(&self.client, extra_ports, &own_port, me),
-                probe_static(&self.client, static_backends, me),
+                discover(&self.client, extra_ports, &own_port, me, creds),
+                probe_static(&self.client, static_backends, me, creds),
                 docked,
             );
             merge_endpoints(merge_endpoints(found, pinned), docked)
@@ -379,8 +389,9 @@ impl Hive {
             .into_iter()
             .map(|(id, base_url, chain, asked, covers)| {
                 let client = self.client.clone();
+                let key = self.credentials.for_url(&base_url).map(str::to_string);
                 async move {
-                    let load = probe_backend(&chain, &client, &base_url, &asked).await;
+                    let load = probe_backend(&chain, &client, &base_url, &asked, key.as_deref()).await;
                     (id, covers, load)
                 }
             })
@@ -1243,7 +1254,9 @@ async fn proxy_by_model(
             .header(axum::http::header::CONTENT_TYPE, content_type.as_str())
             .header(VIA_HEADER, fwd_via.clone())
             .body(fwd_body.clone());
-        if let Some(a) = &auth {
+        if let Some(key) = hive.credentials.for_url(upstream) {
+            req = req.bearer_auth(key);
+        } else if let Some(a) = &auth {
             req = req.header(reqwest::header::AUTHORIZATION, a.clone());
         }
 
@@ -2115,8 +2128,8 @@ mod tests {
         };
         stub(&ha).await;
         stub(&hb).await;
-        let peer_b = probe_static(&ha.client, std::slice::from_ref(&url_b), &ha.own_id()).await;
-        let peer_a = probe_static(&hb.client, std::slice::from_ref(&url_a), &hb.own_id()).await;
+        let peer_b = probe_static(&ha.client, std::slice::from_ref(&url_b), &ha.own_id(), &Credentials::default()).await;
+        let peer_a = probe_static(&hb.client, std::slice::from_ref(&url_a), &hb.own_id(), &Credentials::default()).await;
         assert_eq!(peer_b[0].hive_id.as_deref(), Some(hb.own_id().as_str()));
         assert_eq!(peer_a[0].hive_id.as_deref(), Some(ha.own_id().as_str()));
         *ha.endpoints.write().await = peer_b;
@@ -2151,7 +2164,7 @@ mod tests {
         let app = routes(hive.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         // e.g. `--static-backends http://localhost:8335` on the hive itself.
-        let found = probe_static(&hive.client, &[format!("http://localhost:{port}")], &hive.own_id()).await;
+        let found = probe_static(&hive.client, &[format!("http://localhost:{port}")], &hive.own_id(), &Credentials::default()).await;
         assert_eq!(found.len(), 1);
         assert!(hive.without_self(found).is_empty());
     }
@@ -2204,7 +2217,7 @@ mod tests {
 
     /// One discovery pass over `statics` only (no localhost port scan).
     async fn rescan(hive: &Hive, statics: &[String]) {
-        let found = probe_static(&hive.client, statics, &hive.own_id()).await;
+        let found = probe_static(&hive.client, statics, &hive.own_id(), &Credentials::default()).await;
         hive.set_endpoints(found).await;
     }
 
@@ -2500,7 +2513,7 @@ mod tests {
         let hive = Hive::new(0);
         let pass = |h: Hive, u: String| async move {
             let id = h.own_id();
-            h.scan_and_install(probe_static(&h.client, &[u], &id)).await;
+            h.scan_and_install(probe_static(&h.client, &[u], &id, &Credentials::default())).await;
         };
         let first = tokio::spawn(pass(hive.clone(), url.clone()));
         tokio::time::sleep(Duration::from_millis(50)).await;
@@ -2785,5 +2798,52 @@ Content-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n--B0--\r\n";
         hive.set_endpoints(vec![ep("a", 9001, &["m"]), ep("b", 9002, &["m"])]).await;
         let rr = hive.rr.lock().await;
         assert_eq!(rr.keys().collect::<Vec<_>>(), vec!["m"]);
+    }
+
+    #[tokio::test]
+    async fn backend_keys_are_used_for_probes_load_and_queries() {
+        // Backend protected like `vllm --api-key backend-key`.
+        let seen = Arc::new(StdMutex::new(Vec::<(String, Option<String>)>::new()));
+        let s2 = seen.clone();
+        let mock = Router::new().fallback(move |uri: axum::http::Uri, headers: HeaderMap| {
+            let s2 = s2.clone();
+            async move {
+                let auth = headers.get("authorization").map(|v| v.to_str().unwrap().to_string());
+                lock(&s2).push((uri.path().to_string(), auth.clone()));
+                if auth.as_deref() != Some("Bearer backend-key") {
+                    return (StatusCode::UNAUTHORIZED, "no").into_response();
+                }
+                match uri.path() {
+                    "/v1/models" => Json(serde_json::json!({"data": [{"id": "m"}]})).into_response(),
+                    "/metrics" => "vllm:num_requests_running 2\n".into_response(),
+                    _ => Json(serde_json::json!({"id": "ok", "choices": []})).into_response(),
+                }
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let creds = Credentials::new([(url.clone(), "backend-key".to_string())]);
+        let hive = Hive::new(0).with_credentials(creds.clone()).with_forward_auth(true);
+        let found = probe_static(&hive.client, std::slice::from_ref(&url), &hive.own_id(), &creds).await;
+        assert_eq!(found.len(), 1, "key-protected backend discovered");
+        hive.set_endpoints(found).await;
+        hive.refresh_load().await;
+        let id = hive.snapshot().await[0].id.clone();
+        assert_eq!(hive.loads.read().await[&(id, "m".to_string())], Load::Measured(2));
+
+        let proxy = serve_proxy(hive).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{proxy}/v1/chat/completions"))
+            .bearer_auth("client-token") // forwarded only to key-less backends
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let seen = lock(&seen);
+        assert!(seen.iter().all(|(_, a)| a.as_deref() == Some("Bearer backend-key")), "{seen:?}");
+        assert!(seen.iter().any(|(p, _)| p == "/v1/chat/completions"));
     }
 }

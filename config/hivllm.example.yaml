@@ -1,0 +1,117 @@
+# HivLLM configuration — all your models, one sticky hive. 🐝
+#
+# Usage:  hivllm --config config/hivllm.yaml     (or HIVLLM_CONFIG=…)
+#
+# Every value below is the built-in default: an empty file (or no file)
+# behaves exactly like this one. Command-line flags and their environment
+# variables override the matching key (flag noted next to each key).
+# Unknown keys are rejected, so typos fail at startup instead of being
+# silently ignored. Check the merged result with `hivllm --print-config`.
+#
+# Secrets: prefer `api_key_env: SOME_VAR` (read from the environment at
+# startup) over `api_key: "…"`, so this file can be committed.
+
+server:
+  # --port / HIVLLM_PORT. 8335 = BEES. The Docker HEALTHCHECK follows
+  # HIVLLM_PORT, so set the port that way in containers.
+  port: 8335
+  # --bind. 127.0.0.1 keeps the hive local; 0.0.0.0 exposes it (then set
+  # an API key: the query log holds every prompt and response).
+  bind: 127.0.0.1
+  # --hive-id. Instance id on responses (x-hivllm-id) and Via paths; null
+  # = random per process. Pin it for stable ids in logs. No commas.
+  hive_id: null
+  # --api-key / HIVLLM_API_KEY. Clients must send
+  # `Authorization: Bearer <key>` on every route but /health. null = open.
+  api_key: null
+  # Or read the key from this environment variable (not both).
+  api_key_env: null
+  # --cors-origin. "local" = browser pages served from localhost /
+  # 127.0.0.1 / [::1] on any port; "*" = any site (any page you visit
+  # could read the query log); "https://ui.example,https://x.example" =
+  # that list; "" = CORS disabled.
+  cors_origin: local
+  # --max-body-mb. Largest request body in MiB (long contexts, base64
+  # images, audio uploads). 0 = unlimited.
+  max_body_mb: 64
+
+discovery:
+  # --extra-ports. Localhost ports probed on top of the well-known ones
+  # (11434 Ollama, 1234 LM Studio, 8000 vLLM, 8080 llama.cpp, …) and of
+  # every `ss` listener.
+  extra_ports: []
+  # --static-backends (the flag replaces this list, URLs only).
+  # Backends discovery can't see: docker service names, remote hosts, or
+  # a path-routing gateway (a base may end in /v1). Probed on every scan;
+  # unreachable ones are skipped until they answer. Either a bare URL, or
+  # a URL with the API key the backend expects (vLLM --api-key, a
+  # key-protected peer hive, …):
+  #
+  # static_backends:
+  #   - http://llamacpp:8080
+  #   - url: http://gpu-box:8000
+  #     api_key_env: GPU_BOX_KEY
+  #   - url: http://gateway:8180/general-stage1/v1
+  #     api_key: "sk-local-…"
+  static_backends: []
+  # --docker-socket. Docker Engine socket for container discovery
+  # (containers labeled hivllm.enable=true, optional hivllm.port=8080),
+  # e.g. /var/run/docker.sock. "" = disabled.
+  docker_socket: ""
+  # --scan-interval. Seconds between discovery passes; 0 = scan once at
+  # startup.
+  scan_interval: 30
+  # --drop-after. Consecutive failed scans before a backend leaves the
+  # hive (it keeps its last known models meanwhile). 1 = at the first
+  # failure. Docker containers always leave as soon as they stop.
+  drop_after: 3
+
+routing:
+  # --load-interval. Seconds between backend load polls (vLLM /metrics,
+  # peer hives' /load?model=); 0 = no polling, plain round-robin.
+  load_interval: 5
+  # --connect-timeout. Seconds to open a connection before failing over
+  # to the next backend.
+  connect_timeout: 5
+  # --read-timeout. Longest silence tolerated from a backend, in seconds;
+  # 0 = none. Non-streaming backends stay silent until the generation is
+  # done, so this also caps those; streams are never cut while tokens
+  # keep flowing.
+  read_timeout: 600
+  # --forward-auth. Forward the client's Authorization header to backends
+  # that have no key configured here. Off: the token would reach every
+  # candidate backend.
+  forward_auth: false
+
+log:
+  # --log-file. Query log (one JSON object per line: full request and
+  # response). "" = no query logging.
+  file: hivllm-queries.jsonl
+  # --log-format. Only jsonl for now.
+  format: jsonl
+  # --log-truncate. none = keep everything; chars = cut long strings to
+  # max_chars.
+  truncate: none
+  # --log-max-chars. Max chars per text field when truncate: chars.
+  max_chars: 2000
+  # --log-max-mb. Roll the file once it would exceed this many MiB; the
+  # old one becomes hivllm-queries.<UTC timestamp>.jsonl[.gz]. 0 = never.
+  max_mb: 100
+  # --log-keep. Rolled archives kept (oldest deleted first); 0 = all.
+  keep: 20
+  # --log-compress. Gzip rolled archives (read them with zcat).
+  compress: true
+
+# API keys for backends not listed under discovery.static_backends:
+# discovered ports, Docker containers (http://<container name>:<port>),
+# or a whole host by URL prefix. A URL matches itself and anything below
+# it on a path boundary (http://gpu-box:8000 covers
+# http://gpu-box:8000/v1, never http://gpu-box:80001); the longest match
+# wins. A backend's own key always takes precedence over forward_auth.
+#
+# credentials:
+#   - url: http://127.0.0.1:8000
+#     api_key_env: LOCAL_VLLM_KEY
+#   - url: http://vllm-whisper:8000
+#     api_key: "sk-…"
+credentials: []

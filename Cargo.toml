@@ -24,3 +24,4 @@ chrono = { version = "0.4", features = ["serde", "clock"] }
 tower-http = { version = "0.6", features = ["cors"] }
 bollard = "0.18"
 flate2 = "1.1.10"
+serde_yaml_ng = "0.10"

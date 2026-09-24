@@ -15,7 +15,7 @@
 //! Needs the Engine socket mounted (`-v /var/run/docker.sock:…`) and
 //! `--docker-socket`. Absent socket = this whole module stays idle.
 
-use crate::discovery::{probe_openai_endpoint, well_known_ports, DiscoveredEndpoint};
+use crate::discovery::{probe_openai_endpoint, well_known_ports, Credentials, DiscoveredEndpoint};
 use crate::hive::Hive;
 use bollard::container::ListContainersOptions;
 use bollard::models::EventMessageTypeEnum;
@@ -55,6 +55,7 @@ impl DockerDiscovery {
         &self,
         client: &reqwest::Client,
         self_id: &str,
+        credentials: &Credentials,
     ) -> Vec<DiscoveredEndpoint> {
         let containers = match self
             .docker
@@ -100,7 +101,7 @@ impl DockerDiscovery {
                     for port in ports {
                         let base_url = format!("http://{name}:{port}");
                         if let Some(probed) =
-                            probe_openai_endpoint(&client, &base_url, self_id).await
+                            probe_openai_endpoint(&client, &base_url, self_id, credentials.for_url(&base_url)).await
                         {
                             return Some(DiscoveredEndpoint {
                                 id: format!("docker-{name}-{port}"),

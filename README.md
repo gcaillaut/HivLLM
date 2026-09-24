@@ -133,6 +133,47 @@ cargo run -- --static-backends http://llamacpp:8080,http://gpu-box:8000
 cargo run -- --bind 0.0.0.0
 ```
 
+## Configuration
+
+Everything can be set in a YAML file; every flag has a key there, and
+flags / environment variables override the file:
+
+```bash
+cp config/hivllm.example.yaml config/hivllm.yaml   # git-ignored
+cargo run -- --config config/hivllm.yaml            # or HIVLLM_CONFIG=…
+cargo run -- --config config/hivllm.yaml --print-config   # effective settings
+```
+
+`config/hivllm.example.yaml` lists every key with its default and the
+flag it matches (`--log-max-mb` → `log.max_mb`, …). Precedence: flag or
+env var (`HIVLLM_PORT`, `HIVLLM_API_KEY`) > config file > default.
+Unknown keys are rejected at startup.
+
+**Per-backend credentials** live only in the file. A static backend can
+carry the key it expects, and `credentials` covers discovered backends
+and containers by URL (exact, or a prefix on a path boundary; longest
+match wins). The key is sent as `Authorization: Bearer …` on every
+request to that backend — model probes, load probes and proxied queries
+— and always takes precedence over `routing.forward_auth`. Keys never
+appear in `/api/hive/endpoints`, logs or `--print-config`.
+
+```yaml
+server:
+  bind: 0.0.0.0
+  api_key_env: HIVLLM_API_KEY        # clients authenticate to the hive
+discovery:
+  static_backends:
+    - http://llamacpp:8080
+    - url: http://gpu-box:8000       # vllm serve … --api-key
+      api_key_env: GPU_BOX_KEY
+credentials:
+  - url: http://127.0.0.1:8000       # a discovered local vLLM with a key
+    api_key_env: LOCAL_VLLM_KEY
+```
+
+Prefer `api_key_env` (read at startup; a missing variable is an error)
+over inline `api_key`, so the file can be shared.
+
 ## Docker (`docker/`)
 
 ```bash
@@ -141,6 +182,9 @@ docker run --rm --network host hivllm
 # persist the query log + custom flags:
 docker run --rm --network host -v hivllm-logs:/data hivllm \
   --log-file /data/hivllm-queries.jsonl --port 8335
+# with a config file:
+docker run --rm --network host -v "$PWD/config:/config:ro" \
+  -e HIVLLM_CONFIG=/config/hivllm.yaml hivllm
 # or via compose:
 docker compose -f docker/docker-compose.yml up --build
 ```

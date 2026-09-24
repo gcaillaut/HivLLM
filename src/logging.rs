@@ -230,7 +230,8 @@ pub fn extract_response(body: &Value) -> LoggedResponse {
 /// Truncation strategy for long text in query logs. Applies to logged
 /// requests and responses alike. Default [`Truncate::None`] keeps
 /// everything; [`Truncate::Chars`] cuts long strings to `max_chars`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, ValueEnum, Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Truncate {
     #[default]
     None,

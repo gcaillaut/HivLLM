@@ -11,6 +11,7 @@
 //!   Ties and backends without load info round-robin; unreachable
 //!   backends fail over to the next candidate.
 
+mod config;
 mod discovery;
 mod docker;
 mod hive;
@@ -25,7 +26,7 @@ use axum::{
     response::{IntoResponse, Response},
     Router,
 };
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use std::{
     net::{IpAddr, SocketAddr},
     sync::Arc,
@@ -33,142 +34,227 @@ use std::{
 };
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
+use config::{Config, LogFormat, StaticBackend};
 use hive::Hive;
 use logging::{JsonLinesSink, RequestLogger, Rotation};
 
-/// Query-log output format. Only `jsonl` is implemented today —
-/// `yaml` (and Langfuse/Logfire API sinks) plug into the same
-/// `LogSink` trait (see `src/logging.rs`).
-#[derive(Debug, Clone, Copy, ValueEnum)]
-enum LogFormat {
-    Jsonl,
-}
-
+/// Command line. Every flag overrides the config file key noted in its
+/// help; unset flags leave the file (or the built-in default) alone.
 #[derive(Parser, Debug)]
 #[command(name = "hivllm", about = "All your models. One sticky hive. 🐝")]
 struct Args {
-    /// Port for the unified hive endpoint (8335 = BEES 🐝). In containers
-    /// prefer HIVLLM_PORT: the image's HEALTHCHECK follows it.
-    #[arg(long, env = "HIVLLM_PORT", default_value_t = 8335)]
-    port: u16,
+    /// YAML config file (see config/hivllm.example.yaml). Flags and env
+    /// variables override its keys.
+    #[arg(long, env = "HIVLLM_CONFIG")]
+    config: Option<std::path::PathBuf>,
 
-    /// Interface to bind (127.0.0.1 keeps the hive local; 0.0.0.0 exposes
-    /// it, e.g. from a container with published ports)
-    #[arg(long, default_value = "127.0.0.1")]
-    bind: IpAddr,
-
-    /// Extra localhost ports to probe (in addition to well-known ones)
-    #[arg(long, value_delimiter = ',')]
-    extra_ports: Vec<u16>,
-
-    /// Static backends discovery can't see: base URLs probed for
-    /// `/v1/models` on every rescan (docker service names like
-    /// `http://llamacpp:8080`, remote hosts, …). A base may already
-    /// include the OpenAI `/v1` prefix when the backend lives under a
-    /// path-routing gateway
-    /// (`http://host:8180/general-stage1/v1` probes
-    /// `.../general-stage1/v1/models` and routes
-    /// `.../general-stage1/v1/chat/completions`).
-    /// Comma-separated and/or repeatable. Unreachable entries are
-    /// skipped until they answer.
-    #[arg(long, value_delimiter = ',')]
-    static_backends: Vec<String>,
-
-    /// Docker Engine socket for container auto-discovery
-    /// (`-v /var/run/docker.sock:/var/run/docker.sock` + opt-in labels
-    /// `hivllm.enable=true`, `hivllm.port=8080`). Empty = disabled.
-    #[arg(long, default_value = "")]
-    docker_socket: String,
-
-    /// Re-scan interval in seconds (0 = scan once at startup)
-    #[arg(long, default_value_t = 30)]
-    scan_interval: u64,
-
-    /// Consecutive failed scans before a backend leaves the hive (1 = at
-    /// the first failure). Missing backends keep their last known models
-    /// meanwhile; Docker containers always leave at once.
-    #[arg(long, default_value_t = hive::DEFAULT_DROP_AFTER)]
-    drop_after: u32,
-
-    /// Backend load poll interval in seconds for least-load routing
-    /// (0 = disable polling, fall back to plain round-robin)
-    #[arg(long, default_value_t = 5)]
-    load_interval: u64,
-
-    /// Query log file (one entry per line). Empty = no query logging.
-    #[arg(long, default_value = "hivllm-queries.jsonl")]
-    log_file: String,
-
-    /// Query log format
-    #[arg(long, value_enum, default_value_t = LogFormat::Jsonl)]
-    log_format: LogFormat,
-
-    /// Truncation strategy for long text in query logs (requests + responses)
-    #[arg(long, value_enum, default_value_t = logging::Truncate::None)]
-    log_truncate: logging::Truncate,
-
-    /// Max chars per text field when --log-truncate chars
-    #[arg(long, default_value_t = 2000)]
-    log_max_chars: usize,
-
-    /// Roll the query log once it would exceed this many MiB
-    /// (0 = never roll). Rolled files are timestamped next to the log.
-    #[arg(long, default_value_t = 100)]
-    log_max_mb: u64,
-
-    /// Rolled query-log archives to keep (0 = keep all)
-    #[arg(long, default_value_t = 20)]
-    log_keep: usize,
-
-    /// Gzip rolled query-log archives
-    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
-    log_compress: bool,
-
-    /// Upstream connect timeout in seconds (a dead backend fails over
-    /// to the next candidate after this)
-    #[arg(long, default_value_t = 5)]
-    connect_timeout: u64,
-
-    /// Upstream read timeout in seconds: longest silence tolerated from a
-    /// backend (0 = none). Non-streaming backends answer only once the
-    /// generation is done, so this also caps non-streaming generations;
-    /// streams are never cut while tokens keep flowing.
-    #[arg(long, default_value_t = 600)]
-    read_timeout: u64,
-
-    /// Largest accepted request body in MiB (0 = unlimited). Long
-    /// contexts and base64 images easily exceed a few MB.
-    #[arg(long, default_value_t = 64)]
-    max_body_mb: usize,
-
-    /// Require `Authorization: Bearer <key>` on every route but /health.
-    /// Prefer the env var: flags are visible in `ps`.
-    #[arg(long, env = "HIVLLM_API_KEY", hide_env_values = true, default_value = "")]
-    api_key: String,
-
-    /// Forward the client's `Authorization` header to backends. Off by
-    /// default: the token would reach every candidate backend. With
-    /// --api-key, that forwards the hive key itself (fine when the whole
-    /// fleet shares it).
+    /// Print the effective configuration (inline secrets masked) and exit
     #[arg(long)]
-    forward_auth: bool,
+    print_config: bool,
 
-    /// Instance id stamped on responses and Via paths, so peer hives
-    /// recognise this one whatever address they use. Random by default;
-    /// pin it for stable ids in logs. No commas.
+    /// [server.port] Port for the unified hive endpoint (default 8335 =
+    /// BEES 🐝). In containers prefer HIVLLM_PORT: the image's HEALTHCHECK
+    /// follows it.
+    #[arg(long, env = "HIVLLM_PORT")]
+    port: Option<u16>,
+
+    /// [server.bind] Interface to bind (default 127.0.0.1 keeps the hive
+    /// local; 0.0.0.0 exposes it, e.g. from a container)
+    #[arg(long)]
+    bind: Option<IpAddr>,
+
+    /// [discovery.extra_ports] Extra localhost ports to probe (in addition
+    /// to well-known ones). Comma-separated and/or repeatable.
+    #[arg(long, value_delimiter = ',')]
+    extra_ports: Option<Vec<u16>>,
+
+    /// [discovery.static_backends] Static backends discovery can't see:
+    /// base URLs probed for `/v1/models` on every rescan (docker service
+    /// names, remote hosts, …); may include a gateway's `/v1` prefix
+    /// (`http://host:8180/general-stage1/v1`). Replaces the file's list;
+    /// keys for them stay in the file. Comma-separated and/or repeatable.
+    #[arg(long, value_delimiter = ',')]
+    static_backends: Option<Vec<String>>,
+
+    /// [discovery.docker_socket] Docker Engine socket for container
+    /// discovery (opt-in labels `hivllm.enable=true`, `hivllm.port=8080`).
+    /// Empty (default) = disabled.
+    #[arg(long)]
+    docker_socket: Option<String>,
+
+    /// [discovery.scan_interval] Re-scan interval in seconds (default 30;
+    /// 0 = scan once at startup)
+    #[arg(long)]
+    scan_interval: Option<u64>,
+
+    /// [discovery.drop_after] Consecutive failed scans before a backend
+    /// leaves the hive (default 3; 1 = at the first failure). Docker
+    /// containers always leave at once.
+    #[arg(long)]
+    drop_after: Option<u32>,
+
+    /// [routing.load_interval] Backend load poll interval in seconds
+    /// (default 5; 0 = no polling, plain round-robin)
+    #[arg(long)]
+    load_interval: Option<u64>,
+
+    /// [log.file] Query log file (default hivllm-queries.jsonl). Empty =
+    /// no query logging.
+    #[arg(long)]
+    log_file: Option<String>,
+
+    /// [log.format] Query log format (default jsonl)
+    #[arg(long, value_enum)]
+    log_format: Option<LogFormat>,
+
+    /// [log.truncate] Truncation of long text in query logs (default none)
+    #[arg(long, value_enum)]
+    log_truncate: Option<logging::Truncate>,
+
+    /// [log.max_chars] Max chars per text field with `--log-truncate
+    /// chars` (default 2000)
+    #[arg(long)]
+    log_max_chars: Option<usize>,
+
+    /// [log.max_mb] Roll the query log once it would exceed this many MiB
+    /// (default 100; 0 = never roll)
+    #[arg(long)]
+    log_max_mb: Option<u64>,
+
+    /// [log.keep] Rolled query-log archives to keep (default 20; 0 = all)
+    #[arg(long)]
+    log_keep: Option<usize>,
+
+    /// [log.compress] Gzip rolled query-log archives (default true)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    log_compress: Option<bool>,
+
+    /// [routing.connect_timeout] Upstream connect timeout in seconds
+    /// (default 5): a dead backend fails over after this
+    #[arg(long)]
+    connect_timeout: Option<u64>,
+
+    /// [routing.read_timeout] Longest silence tolerated from a backend, in
+    /// seconds (default 600; 0 = none). Also caps non-streaming
+    /// generations; streams are never cut while tokens flow.
+    #[arg(long)]
+    read_timeout: Option<u64>,
+
+    /// [server.max_body_mb] Largest accepted request body in MiB
+    /// (default 64; 0 = unlimited)
+    #[arg(long)]
+    max_body_mb: Option<usize>,
+
+    /// [server.api_key] Require `Authorization: Bearer <key>` on every
+    /// route but /health. Prefer the env var (flags show in `ps`) or
+    /// `server.api_key_env` in the file.
+    #[arg(long, env = "HIVLLM_API_KEY", hide_env_values = true)]
+    api_key: Option<String>,
+
+    /// [routing.forward_auth] Forward the client's `Authorization` header
+    /// to backends without a configured key (default false: the token
+    /// would reach every candidate)
+    #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+    forward_auth: Option<bool>,
+
+    /// [server.hive_id] Instance id stamped on responses and Via paths.
+    /// Random by default; pin it for stable ids in logs. No commas.
     #[arg(long)]
     hive_id: Option<String>,
 
-    /// CORS allowed origins for browser UIs: "local" = pages served from
-    /// localhost / 127.0.0.1 / [::1] on any port; "*" = any site (lets any
-    /// web page you visit read the query log); a comma-separated origin
-    /// list; empty = disabled.
-    #[arg(long, default_value = "local")]
-    cors_origin: String,
+    /// [server.cors_origin] CORS allowed origins for browser UIs (default
+    /// "local": pages from localhost / 127.0.0.1 / [::1]); "*" = any site
+    /// (lets any page you visit read the query log); a comma-separated
+    /// origin list; empty = disabled.
+    #[arg(long)]
+    cors_origin: Option<String>,
+}
+
+/// Command-line flag → config key, for every flag that has one.
+#[cfg(test)]
+const FLAG_KEYS: &[(&str, &str)] = &[
+    ("port", "server.port"),
+    ("bind", "server.bind"),
+    ("hive_id", "server.hive_id"),
+    ("api_key", "server.api_key"),
+    ("cors_origin", "server.cors_origin"),
+    ("max_body_mb", "server.max_body_mb"),
+    ("extra_ports", "discovery.extra_ports"),
+    ("static_backends", "discovery.static_backends"),
+    ("docker_socket", "discovery.docker_socket"),
+    ("scan_interval", "discovery.scan_interval"),
+    ("drop_after", "discovery.drop_after"),
+    ("load_interval", "routing.load_interval"),
+    ("connect_timeout", "routing.connect_timeout"),
+    ("read_timeout", "routing.read_timeout"),
+    ("forward_auth", "routing.forward_auth"),
+    ("log_file", "log.file"),
+    ("log_format", "log.format"),
+    ("log_truncate", "log.truncate"),
+    ("log_max_chars", "log.max_chars"),
+    ("log_max_mb", "log.max_mb"),
+    ("log_keep", "log.keep"),
+    ("log_compress", "log.compress"),
+];
+
+/// Flags without a config key: they pick or print the config itself.
+#[cfg(test)]
+const META_FLAGS: &[&str] = &["config", "print_config", "help", "version"];
+
+impl Args {
+    /// Overlay every flag that was given onto `cfg`.
+    fn apply(self, cfg: &mut Config) {
+        fn set<T>(slot: &mut T, v: Option<T>) {
+            if let Some(v) = v {
+                *slot = v;
+            }
+        }
+        let (srv, disc, rt, log) = (&mut cfg.server, &mut cfg.discovery, &mut cfg.routing, &mut cfg.log);
+        set(&mut srv.port, self.port);
+        set(&mut srv.bind, self.bind);
+        if self.hive_id.is_some() {
+            srv.hive_id = self.hive_id;
+        }
+        if let Some(key) = self.api_key {
+            // A flag / HIVLLM_API_KEY replaces whatever the file said.
+            srv.api_key = Some(key);
+            srv.api_key_env = None;
+        }
+        set(&mut srv.cors_origin, self.cors_origin);
+        set(&mut srv.max_body_mb, self.max_body_mb);
+        set(&mut disc.extra_ports, self.extra_ports);
+        if let Some(urls) = self.static_backends {
+            disc.static_backends = urls.into_iter().map(StaticBackend::Url).collect();
+        }
+        set(&mut disc.docker_socket, self.docker_socket);
+        set(&mut disc.scan_interval, self.scan_interval);
+        set(&mut disc.drop_after, self.drop_after);
+        set(&mut rt.load_interval, self.load_interval);
+        set(&mut rt.connect_timeout, self.connect_timeout);
+        set(&mut rt.read_timeout, self.read_timeout);
+        set(&mut rt.forward_auth, self.forward_auth);
+        set(&mut log.file, self.log_file);
+        set(&mut log.format, self.log_format);
+        set(&mut log.truncate, self.log_truncate);
+        set(&mut log.max_chars, self.log_max_chars);
+        set(&mut log.max_mb, self.log_max_mb);
+        set(&mut log.keep, self.log_keep);
+        set(&mut log.compress, self.log_compress);
+    }
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+async fn main() -> std::process::ExitCode {
+    match run().await {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("hivllm: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+async fn run() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "hivllm=info,tower_http=info".into()),
@@ -177,58 +263,79 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .init();
 
     let args = Args::parse();
+    let mut cfg = match &args.config {
+        Some(path) => Config::load(path)?,
+        None => Config::default(),
+    };
+    let (config_path, print_config) = (args.config.clone(), args.print_config);
+    args.apply(&mut cfg);
+    if print_config {
+        print!("{}", cfg.to_yaml_redacted());
+        return Ok(());
+    }
+    if let Some(path) = &config_path {
+        tracing::info!(config = %path.display(), "🐝 config loaded");
+    }
+    let api_key = cfg.server_api_key()?.unwrap_or_default();
+    let credentials = cfg.credentials()?;
+    let static_backends = cfg.static_urls();
+    let (srv, disc, rt, log) = (&cfg.server, &cfg.discovery, &cfg.routing, &cfg.log);
 
-    let logger = if args.log_file.is_empty() {
+    let logger = if log.file.is_empty() {
         RequestLogger::new()
     } else {
-        let sink: Arc<dyn logging::LogSink> = match args.log_format {
+        let sink: Arc<dyn logging::LogSink> = match log.format {
             LogFormat::Jsonl => Arc::new(
                 JsonLinesSink::open_with(
-                    &args.log_file,
+                    &log.file,
                     Rotation {
-                        max_bytes: args.log_max_mb.saturating_mul(1024 * 1024),
-                        keep: args.log_keep,
-                        compress: args.log_compress,
+                        max_bytes: log.max_mb.saturating_mul(1024 * 1024),
+                        keep: log.keep,
+                        compress: log.compress,
                     },
                 )
                 .await?,
             ),
         };
         tracing::info!(
-            file = %args.log_file,
+            file = %log.file,
             sink = sink.name(),
-            max_mb = args.log_max_mb,
-            keep = args.log_keep,
-            compress = args.log_compress,
+            max_mb = log.max_mb,
+            keep = log.keep,
+            compress = log.compress,
             "🐝 query log enabled"
         );
         RequestLogger::new().with_sink(sink).spawn_writer()
     };
     let log_queue = logger.clone();
-    let read_timeout = (args.read_timeout > 0).then(|| Duration::from_secs(args.read_timeout));
-    let hive = Hive::new(args.port)
+    let read_timeout = (rt.read_timeout > 0).then(|| Duration::from_secs(rt.read_timeout));
+    let hive = Hive::new(srv.port)
         .with_logger(logger)
-        .with_log_options(args.log_truncate, args.log_max_chars)
-        .with_timeouts(Duration::from_secs(args.connect_timeout), read_timeout)
-        .with_forward_auth(args.forward_auth)
-        .with_drop_after(args.drop_after)
-        .with_max_body((args.max_body_mb > 0).then(|| args.max_body_mb.saturating_mul(1024 * 1024)));
-    let hive = match args.hive_id {
+        .with_log_options(log.truncate, log.max_chars)
+        .with_timeouts(Duration::from_secs(rt.connect_timeout), read_timeout)
+        .with_forward_auth(rt.forward_auth)
+        .with_drop_after(disc.drop_after)
+        .with_max_body((srv.max_body_mb > 0).then(|| srv.max_body_mb.saturating_mul(1024 * 1024)));
+    let hive = match srv.hive_id.clone() {
         Some(id) if !hive::valid_hive_id(&id) => {
-            return Err(format!("invalid --hive-id {id:?}: printable ASCII, no spaces or commas").into());
+            return Err(format!("invalid hive id {id:?}: printable ASCII, no spaces or commas").into());
         }
         Some(id) => hive.with_hive_id(id),
         None => hive,
     };
+    if !credentials.is_empty() {
+        tracing::info!(backends = credentials.len(), "🐝 per-backend API keys loaded");
+    }
+    let hive = hive.with_credentials(credentials);
 
     // Docker socket discovery (opt-in): containers labeled
     // `hivllm.enable=true` join the hive; lifecycle events refresh it.
-    let docker = if args.docker_socket.is_empty() {
+    let docker = if disc.docker_socket.is_empty() {
         None
     } else {
-        match docker::DockerDiscovery::connect(&args.docker_socket).await {
+        match docker::DockerDiscovery::connect(&disc.docker_socket).await {
             Ok(d) => {
-                tracing::info!(socket = %args.docker_socket, "🐝 docker discovery enabled");
+                tracing::info!(socket = %disc.docker_socket, "🐝 docker discovery enabled");
                 Some(d)
             }
             Err(e) => {
@@ -240,16 +347,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Initial discovery before serving.
     hive
-        .refresh(&args.extra_ports, &args.static_backends, docker.as_ref())
+        .refresh(&disc.extra_ports, &static_backends, docker.as_ref())
         .await;
 
     // Prime load state so the first requests are already load-informed.
     // The load refresh announces the hive view; without polling, the
     // discovery refresh announces it instead — either way, exactly once.
-    if args.load_interval > 0 {
+    if rt.load_interval > 0 {
         hive.refresh_load().await;
         let hive_bg = hive.clone();
-        let interval = args.load_interval;
+        let interval = rt.load_interval;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -261,12 +368,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Background re-scan loop.
-    if args.scan_interval > 0 {
+    if disc.scan_interval > 0 {
         let hive_bg = hive.clone();
-        let extra = args.extra_ports.clone();
-        let pinned = args.static_backends.clone();
+        let extra = disc.extra_ports.clone();
+        let pinned = static_backends.clone();
         let dock = docker.clone();
-        let interval = args.scan_interval;
+        let interval = disc.scan_interval;
         tokio::spawn(async move {
             loop {
                 tokio::time::sleep(Duration::from_secs(interval)).await;
@@ -279,20 +386,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Docker lifecycle watcher: instant refresh on container changes.
     if let Some(d) = docker {
         let hive_bg = hive.clone();
-        let extra = args.extra_ports.clone();
-        let pinned = args.static_backends.clone();
+        let extra = disc.extra_ports.clone();
+        let pinned = static_backends.clone();
         tokio::spawn(async move {
             d.watch_events(hive_bg, extra, pinned).await;
         });
     }
 
-    if args.api_key.is_empty() && !args.bind.is_loopback() {
-        tracing::warn!(bind = %args.bind, "hive exposed without --api-key: anyone who can reach it can use every model and read the query log");
+    if api_key.is_empty() && !srv.bind.is_loopback() {
+        tracing::warn!(bind = %srv.bind, "hive exposed without an API key: anyone who can reach it can use every model and read the query log");
     }
     let hive_id = hive.own_id();
-    let app = build_router(hive, &args.cors_origin, &args.api_key);
+    let app = build_router(hive, &srv.cors_origin, &api_key);
 
-    let addr = SocketAddr::from((args.bind, args.port));
+    let addr = SocketAddr::from((srv.bind, srv.port));
     tracing::info!("🐝 HivLLM hive {} listening on http://{addr}", hive_id);
     tracing::info!("   GET  /v1/models, /v1/models/{{id}}");
     tracing::info!("   POST /v1/chat/completions, /v1/completions, /v1/embeddings, /v1/responses");
@@ -433,6 +540,60 @@ fn cors_layer(spec: &str) -> Option<tower_http::cors::CorsLayer> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_flag_has_a_config_key() {
+        use clap::CommandFactory;
+        let defaults = serde_yaml_ng::to_value(Config::default()).unwrap();
+        for arg in Args::command().get_arguments() {
+            let id = arg.get_id().as_str();
+            if META_FLAGS.contains(&id) {
+                continue;
+            }
+            let (_, key) = FLAG_KEYS
+                .iter()
+                .find(|(flag, _)| *flag == id)
+                .unwrap_or_else(|| panic!("flag --{id} has no config key"));
+            let mut node = &defaults;
+            for part in key.split('.') {
+                node = node
+                    .get(part)
+                    .unwrap_or_else(|| panic!("--{id} maps to {key}, which the config lacks"));
+            }
+            // The flag's help names its key, so `--help` documents it.
+            let help = arg.get_help().map(|h| h.to_string()).unwrap_or_default();
+            assert!(help.contains(&format!("[{key}]")), "--{id} help should mention [{key}]");
+        }
+    }
+
+    #[test]
+    fn flags_override_the_file_and_the_file_overrides_defaults() {
+        let mut cfg = Config::from_yaml(
+            "server:\n  port: 8000\n  api_key_env: SOME_VAR\ndiscovery:\n  scan_interval: 10\nlog:\n  compress: true\n",
+        )
+        .unwrap();
+        let args = Args::try_parse_from([
+            "hivllm",
+            "--port",
+            "9000",
+            "--log-compress",
+            "false",
+            "--forward-auth",
+            "--api-key",
+            "flag-key",
+            "--static-backends",
+            "http://a:1,http://b:2",
+        ])
+        .unwrap();
+        args.apply(&mut cfg);
+        assert_eq!(cfg.server.port, 9000);
+        assert!(!cfg.log.compress);
+        assert!(cfg.routing.forward_auth);
+        assert_eq!(cfg.discovery.scan_interval, 10, "untouched by flags: the file's value");
+        assert_eq!(cfg.routing.load_interval, 5, "in neither: the default");
+        assert_eq!(cfg.server_api_key().unwrap().as_deref(), Some("flag-key"));
+        assert_eq!(cfg.static_urls(), vec!["http://a:1", "http://b:2"]);
+    }
 
     #[test]
     fn local_origins_only() {

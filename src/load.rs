@@ -43,12 +43,23 @@ pub enum Load {
 /// (their whole box is busy for every model they serve).
 pub trait LoadProbe: Send + Sync {
     fn name(&self) -> &'static str;
+    /// `key`: the backend's API key, if one is configured.
     fn probe<'a>(
         &'a self,
         client: &'a reqwest::Client,
         base_url: &'a str,
         model: &'a str,
+        key: Option<&'a str>,
     ) -> BoxFuture<'a, Load>;
+}
+
+/// GET with the backend's key, if any.
+fn get(client: &reqwest::Client, url: &str, key: Option<&str>) -> reqwest::RequestBuilder {
+    let req = client.get(url);
+    match key {
+        Some(k) => req.bearer_auth(k),
+        None => req,
+    }
 }
 
 /// vLLM `GET /metrics` (Prometheus text format): sum of
@@ -71,11 +82,11 @@ impl LoadProbe for VllmMetricsProbe {
         client: &'a reqwest::Client,
         base_url: &'a str,
         _model: &'a str,
+        key: Option<&'a str>,
     ) -> BoxFuture<'a, Load> {
         Box::pin(async move {
             let url = format!("{}/metrics", server_root(base_url));
-            let resp = match client
-                .get(&url)
+            let resp = match get(client, &url, key)
                 .timeout(Duration::from_secs(3))
                 .send()
                 .await
@@ -154,11 +165,11 @@ impl LoadProbe for HivLoadProbe {
         client: &'a reqwest::Client,
         base_url: &'a str,
         model: &'a str,
+        key: Option<&'a str>,
     ) -> BoxFuture<'a, Load> {
         Box::pin(async move {
             let url = format!("{}/load", server_root(base_url));
-            let resp = match client
-                .get(&url)
+            let resp = match get(client, &url, key)
                 .query(&[("model", model)])
                 .timeout(Duration::from_secs(2))
                 .send()
@@ -215,11 +226,11 @@ impl LoadProbe for VllmLoadProbe {
         client: &'a reqwest::Client,
         base_url: &'a str,
         _model: &'a str,
+        key: Option<&'a str>,
     ) -> BoxFuture<'a, Load> {
         Box::pin(async move {
             let url = format!("{}/load", server_root(base_url));
-            let resp = match client
-                .get(&url)
+            let resp = match get(client, &url, key)
                 .timeout(Duration::from_secs(2))
                 .send()
                 .await
@@ -256,9 +267,10 @@ pub async fn probe_backend(
     client: &reqwest::Client,
     base_url: &str,
     model: &str,
+    key: Option<&str>,
 ) -> Load {
     for probe in probes {
-        match probe.probe(client, base_url, model).await {
+        match probe.probe(client, base_url, model, key).await {
             Load::Unknown => continue,
             load => return load,
         }
@@ -318,7 +330,7 @@ mod tests {
         ))
         .await;
         assert_eq!(
-            VllmLoadProbe.probe(&client(), &url, "m").await,
+            VllmLoadProbe.probe(&client(), &url, "m", None).await,
             Load::Known(3)
         );
     }
@@ -342,7 +354,7 @@ mod tests {
         .await;
         for url in [missing, broken, weird] {
             assert_eq!(
-                VllmLoadProbe.probe(&client(), &url, "m").await,
+                VllmLoadProbe.probe(&client(), &url, "m", None).await,
                 Load::Unknown,
                 "{url}"
             );
@@ -357,7 +369,7 @@ mod tests {
         let url = format!("http://{}", listener.local_addr().unwrap());
         drop(listener); // nothing listens here anymore
         assert_eq!(
-            VllmLoadProbe.probe(&client(), &url, "m").await,
+            VllmLoadProbe.probe(&client(), &url, "m", None).await,
             Load::Unknown
         );
     }
@@ -374,6 +386,7 @@ mod tests {
             _client: &'a reqwest::Client,
             _base_url: &'a str,
             _model: &'a str,
+            _key: Option<&'a str>,
         ) -> BoxFuture<'a, Load> {
             let load = self.0;
             Box::pin(async move { load })
@@ -385,18 +398,18 @@ mod tests {
         let probes: Vec<Arc<dyn LoadProbe>> =
             vec![Arc::new(FixedProbe(Load::Unknown)), Arc::new(FixedProbe(Load::Known(7)))];
         assert_eq!(
-            probe_backend(&probes, &client(), "http://127.0.0.1:9", "m").await,
+            probe_backend(&probes, &client(), "http://127.0.0.1:9", "m", None).await,
             Load::Known(7)
         );
         let measured: Vec<Arc<dyn LoadProbe>> =
             vec![Arc::new(FixedProbe(Load::Measured(0))), Arc::new(FixedProbe(Load::Known(7)))];
         assert_eq!(
-            probe_backend(&measured, &client(), "http://127.0.0.1:9", "m").await,
+            probe_backend(&measured, &client(), "http://127.0.0.1:9", "m", None).await,
             Load::Measured(0)
         );
         let none: Vec<Arc<dyn LoadProbe>> = vec![Arc::new(FixedProbe(Load::Unknown))];
         assert_eq!(
-            probe_backend(&none, &client(), "http://127.0.0.1:9", "m").await,
+            probe_backend(&none, &client(), "http://127.0.0.1:9", "m", None).await,
             Load::Unknown
         );
     }
@@ -464,7 +477,7 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
         ))
         .await;
         assert_eq!(
-            VllmMetricsProbe.probe(&client(), &url, "m").await,
+            VllmMetricsProbe.probe(&client(), &url, "m", None).await,
             Load::Measured(39)
         );
     }
@@ -473,7 +486,7 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
     async fn metrics_probe_missing_endpoint_is_unknown() {
         let url = serve(Router::new().route("/other", get(|| async { "x" }))).await;
         assert_eq!(
-            VllmMetricsProbe.probe(&client(), &url, "m").await,
+            VllmMetricsProbe.probe(&client(), &url, "m", None).await,
             Load::Unknown
         );
     }
@@ -490,12 +503,12 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
         ))
         .await;
         assert_eq!(
-            HivLoadProbe.probe(&client(), &url, "hot").await,
+            HivLoadProbe.probe(&client(), &url, "hot", None).await,
             Load::Measured(12)
         );
         // An exact zero from a hive really means idle.
         assert_eq!(
-            HivLoadProbe.probe(&client(), &url, "cold").await,
+            HivLoadProbe.probe(&client(), &url, "cold", None).await,
             Load::Measured(0)
         );
     }
@@ -517,7 +530,7 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
             ))
             .await;
             assert_eq!(
-                HivLoadProbe.probe(&client(), &url, "m").await,
+                HivLoadProbe.probe(&client(), &url, "m", None).await,
                 Load::Unknown,
                 "{body}"
             );
@@ -535,7 +548,7 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
         ))
         .await;
         assert_eq!(
-            VllmLoadProbe.probe(&client(), &url, "m").await,
+            VllmLoadProbe.probe(&client(), &url, "m", None).await,
             Load::Unknown
         );
     }
@@ -551,7 +564,7 @@ vllm:kv_cache_usage_perc{engine="0",model_name="olala-7a1b-50k-antidoom-fix"} 0.
         ))
         .await;
         assert_eq!(
-            HivLoadProbe.probe(&client(), &url, "m").await,
+            HivLoadProbe.probe(&client(), &url, "m", None).await,
             Load::Unknown
         );
     }

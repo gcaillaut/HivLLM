@@ -43,6 +43,52 @@ pub struct DiscoveredEndpoint {
 /// of the probing hive, so the answer leaves out routes through it.
 pub const VIA_HEADER: &str = "x-hivllm-via";
 
+/// Per-backend API keys, sent as `Authorization: Bearer …` on every
+/// request to a matching backend (model probes, load probes, proxied
+/// queries). An entry matches a base URL equal to it or below it on a
+/// path boundary (`http://gpu:8000` covers `http://gpu:8000/v1`, never
+/// `http://gpu:80001`); the longest match wins. Keys never leave via
+/// `Debug`, logs or the hive's APIs.
+#[derive(Clone, Default)]
+pub struct Credentials(Vec<(String, String)>);
+
+impl Credentials {
+    /// `(base URL or prefix, key)` pairs; URLs are normalised like
+    /// static backends.
+    pub fn new(entries: impl IntoIterator<Item = (String, String)>) -> Self {
+        let mut v: Vec<(String, String)> = entries
+            .into_iter()
+            .map(|(url, key)| (normalize_base_url(&url), key))
+            .collect();
+        v.sort_by_key(|(url, _)| std::cmp::Reverse(url.len())); // longest first
+        Self(v)
+    }
+
+    pub fn for_url(&self, base_url: &str) -> Option<&str> {
+        let url = base_url.trim_end_matches('/');
+        self.0.iter().find_map(|(prefix, key)| {
+            let hit = url == prefix
+                || url.strip_prefix(prefix.as_str()).is_some_and(|rest| rest.starts_with('/'));
+            hit.then_some(key.as_str())
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.0.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+}
+
+impl std::fmt::Debug for Credentials {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let urls: Vec<&str> = self.0.iter().map(|(u, _)| u.as_str()).collect();
+        f.debug_struct("Credentials").field("urls", &urls).finish_non_exhaustive()
+    }
+}
+
 /// Longest hive path kept: deeper chains are dropped, never trusted.
 pub const MAX_HOPS: usize = 8;
 
@@ -171,11 +217,14 @@ pub async fn probe_openai_endpoint(
     client: &reqwest::Client,
     base_url: &str,
     self_id: &str,
+    key: Option<&str>,
 ) -> Option<Probed> {
     let url = models_url(base_url);
-    let resp = client
-        .get(&url)
-        .header(VIA_HEADER, self_id)
+    let mut req = client.get(&url).header(VIA_HEADER, self_id);
+    if let Some(k) = key {
+        req = req.bearer_auth(k);
+    }
+    let resp = req
         .timeout(Duration::from_secs(2))
         .send()
         .await
@@ -332,6 +381,7 @@ pub async fn discover(
     extra_ports: &[u16],
     exclude_ports: &[u16],
     self_id: &str,
+    credentials: &Credentials,
 ) -> Vec<DiscoveredEndpoint> {
     // One `ss -tlnp` covers both listening ports and process names;
     // both commands run concurrently, each bounded (missing = empty).
@@ -355,7 +405,8 @@ pub async fn discover(
             let docker_ports = &docker_ports;
             async move {
                 let base_url = format!("http://127.0.0.1:{port}");
-                let probed = probe_openai_endpoint(client, &base_url, self_id).await?;
+                let key = credentials.for_url(&base_url);
+                let probed = probe_openai_endpoint(client, &base_url, self_id, key).await?;
                 let source = if docker_ports.contains(&port) {
                     "docker"
                 } else if well_known_ports(&[]).contains(&port) {
@@ -413,13 +464,15 @@ pub async fn probe_static(
     client: &reqwest::Client,
     urls: &[String],
     self_id: &str,
+    credentials: &Credentials,
 ) -> Vec<DiscoveredEndpoint> {
     let probed: Vec<Option<DiscoveredEndpoint>> = stream::iter(urls.iter().cloned())
         .map(|raw| {
             let client = client.clone();
             async move {
                 let base_url = normalize_base_url(&raw);
-                let probed = match probe_openai_endpoint(&client, &base_url, self_id).await {
+                let key = credentials.for_url(&base_url);
+                let probed = match probe_openai_endpoint(&client, &base_url, self_id, key).await {
                     Some(p) => p,
                     None => {
                         tracing::warn!(%base_url, "static backend unreachable, skipping");
@@ -632,6 +685,7 @@ mod tests {
                 format!("127.0.0.1:{dead}"),
             ],
             "test-hive",
+            &Credentials::default(),
         )
         .await;
         assert_eq!(found.len(), 1);
@@ -662,6 +716,7 @@ mod tests {
             &client,
             &[format!("http://127.0.0.1:{port}/general-stage1/v1")],
             "test-hive",
+            &Credentials::default(),
         )
         .await;
         assert_eq!(found.len(), 1);
@@ -712,5 +767,19 @@ LISTEN 0 128 [::]:9090 [::]:*\n";
         assert!(start.elapsed() < Duration::from_secs(2));
         assert_eq!(command_output("hivllm-no-such-binary", &[], COMMAND_TIMEOUT).await, "");
         assert_eq!(command_output("echo", &["hi"], COMMAND_TIMEOUT).await, "hi\n");
+    }
+
+    #[test]
+    fn credentials_match_exactly_or_below_on_a_path_boundary() {
+        let c = Credentials::new([
+            ("http://gpu:8000".to_string(), "k1".to_string()),
+            ("gpu:8000/special/v1/".to_string(), "k2".to_string()),
+        ]);
+        assert_eq!(c.for_url("http://gpu:8000"), Some("k1"));
+        assert_eq!(c.for_url("http://gpu:8000/v1"), Some("k1"));
+        assert_eq!(c.for_url("http://gpu:8000/special/v1"), Some("k2")); // longest wins
+        assert_eq!(c.for_url("http://gpu:80001"), None);
+        assert_eq!(c.for_url("http://other:8000"), None);
+        assert!(!format!("{c:?}").contains("k1"), "keys never printed");
     }
 }

@@ -1,3 +1,7 @@
 /target
 hivllm-queries.jsonl
 HIVESTUDIO.md
+hivllm-queries.*.jsonl*
+# Real configs may hold secrets; only the example is tracked.
+config/*.yaml
+!config/hivllm.example.yaml

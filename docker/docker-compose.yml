@@ -20,7 +20,14 @@ services:
     restart: unless-stopped
     volumes:
       - query-logs:/data
-    # Persist the query log outside the container's writable layer.
+      # Optional YAML config (copy config/hivllm.example.yaml to
+      # config/hivllm.yaml), then uncomment HIVLLM_CONFIG below.
+      - ../config:/config:ro
+    # environment:
+    #   HIVLLM_CONFIG: /config/hivllm.yaml
+    #   GPU_BOX_KEY: ${GPU_BOX_KEY}   # secrets referenced by api_key_env
+    # Persist the query log outside the container's writable layer
+    # (flags override the config file).
     command: ["--log-file", "/data/hivllm-queries.jsonl"]
 
 volumes:
