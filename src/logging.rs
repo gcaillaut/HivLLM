@@ -429,23 +429,80 @@ impl RequestLogger {
     }
 }
 
-/// Appends one JSON object per line: `<entry as JSON>\n`.
+/// Size-based rolling for [`JsonLinesSink`]. When the live file would grow
+/// past `max_bytes`, it is renamed to a timestamped archive next to it
+/// (`hivllm-queries.jsonl` → `hivllm-queries.20260924T101500.123Z.jsonl`),
+/// gzipped in the background (`….jsonl.gz`) and the oldest archives beyond
+/// `keep` are deleted. Entries are never truncated by rolling.
+#[derive(Debug, Clone, Copy)]
+pub struct Rotation {
+    /// Roll when the live file would exceed this size. 0 = never roll.
+    pub max_bytes: u64,
+    /// Archives kept after rolling. 0 = keep all.
+    pub keep: usize,
+    /// Gzip archives.
+    pub compress: bool,
+}
+
+/// Appends one JSON object per line: `<entry as JSON>\n`, rolling the file
+/// per [`Rotation`].
 pub struct JsonLinesSink {
     path: String,
-    file: Mutex<tokio::fs::File>,
+    rotation: Rotation,
+    live: Mutex<LiveFile>,
+}
+
+struct LiveFile {
+    file: tokio::fs::File,
+    size: u64,
+}
+
+async fn open_append(path: &str) -> std::io::Result<LiveFile> {
+    let file = tokio::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+        .await?;
+    let size = file.metadata().await?.len();
+    Ok(LiveFile { file, size })
 }
 
 impl JsonLinesSink {
+    /// Never rolls.
+    #[cfg(test)]
     pub async fn open(path: &str) -> std::io::Result<Self> {
-        let file = tokio::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-            .await?;
+        let never = Rotation { max_bytes: 0, keep: 0, compress: false };
+        Self::open_with(path, never).await
+    }
+
+    pub async fn open_with(path: &str, rotation: Rotation) -> std::io::Result<Self> {
         Ok(Self {
             path: path.to_string(),
-            file: Mutex::new(file),
+            rotation,
+            live: Mutex::new(open_append(path).await?),
         })
+    }
+
+    /// Move the live file to a fresh archive and reopen it empty.
+    /// Compression and pruning run off the logging path.
+    async fn roll(&self, live: &mut LiveFile) -> std::io::Result<()> {
+        use tokio::io::AsyncWriteExt;
+        live.file.flush().await?;
+        let archive = ArchiveName::new(&self.path).fresh_path();
+        tokio::fs::rename(&self.path, &archive).await?;
+        *live = open_append(&self.path).await?;
+        let (path, rotation) = (self.path.clone(), self.rotation);
+        tokio::task::spawn_blocking(move || {
+            if rotation.compress {
+                if let Err(e) = gzip_in_place(&archive) {
+                    tracing::warn!(error = %e, archive = %archive.display(), "query log compression failed");
+                }
+            }
+            if rotation.keep > 0 {
+                prune_archives(&path, rotation.keep);
+            }
+        });
+        Ok(())
     }
 }
 
@@ -460,15 +517,178 @@ impl LogSink for JsonLinesSink {
 
     fn emit<'a>(&'a self, entry: LogEntry) -> BoxFuture<'a, ()> {
         Box::pin(async move {
+            use tokio::io::AsyncWriteExt;
             let mut line = serde_json::to_vec(&entry).unwrap_or_default();
             line.push(b'\n');
-            let mut file = self.file.lock().await;
-            use tokio::io::AsyncWriteExt;
-            if let Err(e) = file.write_all(&line).await {
-                tracing::warn!(error = %e, "query log write failed");
+            let mut live = self.live.lock().await;
+            let max = self.rotation.max_bytes;
+            if max > 0 && live.size > 0 && live.size + line.len() as u64 > max {
+                if let Err(e) = self.roll(&mut live).await {
+                    tracing::warn!(error = %e, "query log rolling failed, still appending");
+                }
+            }
+            // tokio's File buffers writes in a background task: without the
+            // flush, entries (and write errors) surface late or never.
+            let written = async {
+                live.file.write_all(&line).await?;
+                live.file.flush().await
+            };
+            match written.await {
+                Ok(()) => live.size += line.len() as u64,
+                Err(e) => tracing::warn!(error = %e, "query log write failed"),
             }
         })
     }
+}
+
+/// Naming scheme shared by rolling, pruning and reading back:
+/// `{dir}/{stem}.{timestamp}{.ext}{.gz}`.
+struct ArchiveName {
+    dir: std::path::PathBuf,
+    live_name: String,
+    stem: String,
+    /// `.jsonl` (with the dot), or empty when the live file has no extension.
+    ext: String,
+}
+
+impl ArchiveName {
+    fn new(live: &str) -> Self {
+        let p = std::path::Path::new(live);
+        let dir = match p.parent() {
+            Some(d) if !d.as_os_str().is_empty() => d.to_path_buf(),
+            _ => std::path::PathBuf::from("."),
+        };
+        let str_of = |o: Option<&std::ffi::OsStr>| {
+            o.map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+        };
+        let ext = str_of(p.extension());
+        Self {
+            dir,
+            live_name: str_of(p.file_name()),
+            stem: str_of(p.file_stem()),
+            ext: if ext.is_empty() { ext } else { format!(".{ext}") },
+        }
+    }
+
+    /// Unused archive path for "now" (millisecond timestamps, suffixed on
+    /// the rare collision).
+    fn fresh_path(&self) -> std::path::PathBuf {
+        let ts = Utc::now().format("%Y%m%dT%H%M%S%.3fZ").to_string();
+        let mut n = 0;
+        loop {
+            let tag = if n == 0 { ts.clone() } else { format!("{ts}-{n}") };
+            let plain = self.dir.join(format!("{}.{tag}{}", self.stem, self.ext));
+            let gz = self.dir.join(format!("{}.{tag}{}.gz", self.stem, self.ext));
+            if !plain.exists() && !gz.exists() {
+                return plain;
+            }
+            n += 1;
+        }
+    }
+
+    /// Timestamp tag of an archive file name, if it is one of ours.
+    fn tag_of<'n>(&self, name: &'n str) -> Option<&'n str> {
+        if name == self.live_name {
+            return None;
+        }
+        let rest = name.strip_prefix(&self.stem)?.strip_prefix('.')?;
+        let rest = rest.strip_suffix(".gz").unwrap_or(rest);
+        let tag = rest.strip_suffix(self.ext.as_str())?;
+        tag.starts_with(|c: char| c.is_ascii_digit()).then_some(tag)
+    }
+
+    /// Archives newest first, one entry per tag: `(tag, files)`. A tag can
+    /// briefly have both the plain file and its `.gz` while compressing;
+    /// the plain one is listed first (the `.gz` may not be final yet).
+    fn list(&self) -> Vec<(String, Vec<std::path::PathBuf>)> {
+        let mut by_tag: std::collections::BTreeMap<String, Vec<std::path::PathBuf>> =
+            Default::default();
+        let Ok(entries) = std::fs::read_dir(&self.dir) else {
+            return Vec::new();
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if let Some(tag) = self.tag_of(&name) {
+                by_tag.entry(tag.to_string()).or_default().push(entry.path());
+            }
+        }
+        let mut out: Vec<_> = by_tag.into_iter().rev().collect();
+        for (_, files) in &mut out {
+            files.sort_by_key(|f| f.extension().is_some_and(|e| e == "gz"));
+        }
+        out
+    }
+}
+
+/// `archive` → `archive.gz` (written as `.gz.tmp`, then renamed, so a
+/// `.gz` on disk is always complete), then the plain file is removed.
+fn gzip_in_place(archive: &std::path::Path) -> std::io::Result<()> {
+    let name = archive.file_name().unwrap_or_default().to_string_lossy();
+    let gz = archive.with_file_name(format!("{name}.gz"));
+    let tmp = archive.with_file_name(format!("{name}.gz.tmp"));
+    let mut input = std::fs::File::open(archive)?;
+    let mut enc = flate2::write::GzEncoder::new(
+        std::fs::File::create(&tmp)?,
+        flate2::Compression::default(),
+    );
+    std::io::copy(&mut input, &mut enc)?;
+    enc.finish()?.sync_all()?;
+    std::fs::rename(&tmp, &gz)?;
+    std::fs::remove_file(archive)
+}
+
+/// Delete archives beyond the newest `keep`.
+fn prune_archives(live: &str, keep: usize) {
+    for (_, files) in ArchiveName::new(live).list().into_iter().skip(keep) {
+        for f in files {
+            if let Err(e) = std::fs::remove_file(&f) {
+                tracing::warn!(error = %e, file = %f.display(), "query log pruning failed");
+            }
+        }
+    }
+}
+
+/// Last `limit` entries across the live file and its archives, newest
+/// first. Lines that don't parse (e.g. one being written) are skipped.
+pub async fn read_recent(live: &str, limit: usize) -> Vec<Value> {
+    let live = live.to_string();
+    tokio::task::spawn_blocking(move || {
+        let mut out = Vec::new();
+        let take_from = |content: &str, out: &mut Vec<Value>| {
+            for line in content.lines().rev() {
+                if out.len() >= limit {
+                    return;
+                }
+                if let Ok(v) = serde_json::from_str(line) {
+                    out.push(v);
+                }
+            }
+        };
+        take_from(&std::fs::read_to_string(&live).unwrap_or_default(), &mut out);
+        for (_, files) in ArchiveName::new(&live).list() {
+            if out.len() >= limit {
+                break;
+            }
+            if let Some(content) = files.iter().find_map(|f| read_archive(f).ok()) {
+                take_from(&content, &mut out);
+            }
+        }
+        out
+    })
+    .await
+    .unwrap_or_default()
+}
+
+fn read_archive(path: &std::path::Path) -> std::io::Result<String> {
+    use std::io::Read;
+    let file = std::fs::File::open(path)?;
+    let mut content = String::new();
+    if path.extension().is_some_and(|e| e == "gz") {
+        flate2::read::GzDecoder::new(file).read_to_string(&mut content)?;
+    } else {
+        std::io::BufReader::new(file).read_to_string(&mut content)?;
+    }
+    Ok(content)
 }
 
 #[cfg(test)]
@@ -518,16 +738,8 @@ mod tests {
         };
         sink.emit(entry).await;
         drop(sink);
-        // Read with a deadline: some filesystems/sandboxes make appends
-        // visible to subsequent readers with a tiny delay.
-        let mut content = String::new();
-        for _ in 0..200 {
-            content = std::fs::read_to_string(&path).unwrap_or_default();
-            if content.lines().count() == 1 {
-                break;
-            }
-            std::thread::sleep(std::time::Duration::from_millis(10));
-        }
+        // Flushed on emit: visible to readers right away.
+        let content = std::fs::read_to_string(&path).unwrap_or_default();
         assert_eq!(content.lines().count(), 1);
         let v: Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(v["route"], "embeddings");
@@ -599,5 +811,104 @@ mod tests {
         assert!(t["long"].as_str().unwrap().starts_with("xxxxxxxxxx…"));
         let kept = truncate_value(serde_json::json!({"a": 1}), Truncate::None, 10);
         assert_eq!(kept["a"], 1);
+    }
+
+    fn entry(model: &str) -> LogEntry {
+        LogEntry {
+            ts: Utc::now(),
+            route: "chat",
+            model: model.into(),
+            upstream: None,
+            stream: false,
+            status: 200,
+            latency_ms: 1,
+            usage: None,
+            error: None,
+            request: serde_json::json!({"pad": "x".repeat(200)}),
+            response: None,
+        }
+    }
+
+    fn scratch_dir(name: &str) -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "hivllm-{name}-{}-{}",
+            std::process::id(),
+            Utc::now().timestamp_nanos_opt().unwrap_or_default()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn names(dir: &std::path::Path) -> Vec<String> {
+        let mut v: Vec<String> = std::fs::read_dir(dir)
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        v.sort();
+        v
+    }
+
+    #[tokio::test]
+    async fn rolls_compresses_prunes_and_reads_back_across_archives() {
+        let dir = scratch_dir("roll");
+        let live = dir.join("q.jsonl");
+        let live_s = live.to_str().unwrap();
+        // Every entry (~300 bytes) overflows 300 bytes: one roll per entry.
+        let rotation = Rotation { max_bytes: 300, keep: 2, compress: true };
+        let sink = JsonLinesSink::open_with(live_s, rotation).await.unwrap();
+        for i in 0..6 {
+            sink.emit(entry(&format!("m{i}"))).await;
+        }
+        // Compression + pruning run in the background: wait for them.
+        let settled = |n: &[String]| {
+            n.iter().filter(|f| f.ends_with(".jsonl.gz")).count() == 2
+                && n.iter().filter(|f| f.starts_with("q.2")).all(|f| f.ends_with(".gz"))
+        };
+        for _ in 0..200 {
+            if settled(&names(&dir)) {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        let files = names(&dir);
+        assert!(settled(&files), "{files:?}");
+        assert!(files.contains(&"q.jsonl".to_string()), "{files:?}");
+        assert_eq!(files.len(), 3, "{files:?}");
+
+        // Newest first: live file (m5), then the two kept archives.
+        let recent = read_recent(live_s, 10).await;
+        let models: Vec<&str> = recent.iter().map(|v| v["model"].as_str().unwrap()).collect();
+        assert_eq!(models, vec!["m5", "m4", "m3"]);
+        assert_eq!(read_recent(live_s, 2).await.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn rolling_without_compression_keeps_plain_archives() {
+        let dir = scratch_dir("roll-plain");
+        let live = dir.join("q.jsonl");
+        let rotation = Rotation { max_bytes: 300, keep: 0, compress: false };
+        let sink = JsonLinesSink::open_with(live.to_str().unwrap(), rotation).await.unwrap();
+        for i in 0..3 {
+            sink.emit(entry(&format!("m{i}"))).await;
+        }
+        let files = names(&dir);
+        assert_eq!(files.len(), 3, "{files:?}");
+        assert!(files.iter().all(|f| f.ends_with(".jsonl")), "{files:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn archive_names_only_match_our_scheme() {
+        let a = ArchiveName::new("/logs/q.jsonl");
+        assert_eq!(a.tag_of("q.20260924T101500.123Z.jsonl"), Some("20260924T101500.123Z"));
+        assert_eq!(a.tag_of("q.20260924T101500.123Z-1.jsonl.gz"), Some("20260924T101500.123Z-1"));
+        assert_eq!(a.tag_of("q.jsonl"), None); // the live file
+        assert_eq!(a.tag_of("q.20260924T101500.123Z.jsonl.gz.tmp"), None);
+        assert_eq!(a.tag_of("q.backup.jsonl"), None);
+        assert_eq!(a.tag_of("other.20260924T101500.123Z.jsonl"), None);
+        let bare = ArchiveName::new("queries");
+        assert_eq!(bare.tag_of("queries.20260924T101500.123Z.gz"), Some("20260924T101500.123Z"));
     }
 }

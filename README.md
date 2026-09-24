@@ -23,8 +23,11 @@ and gathers them behind a **single endpoint**.
       first, `GET /load` as fallback (only truthful with
       `--enable-server-load-tracking` server-side) — and requests go to
       the lowest *effective* load: `max(server_load, hive-observed
-      in-flight requests)`. Ties round-robin; unreachable
-      backends fail over to the next candidate.
+      in-flight requests)` (requests count as in flight from the moment
+      they are sent). Ties round-robin; unreachable backends fail over to
+      the next candidate and are ranked last for 15s, so a dead backend
+      stops looking idle. A backend that times out is answered `504`, not
+      retried elsewhere (it may still be generating).
     - Stdout shows the same numbers the balancer uses, per model:
       positive server reports as `load=N`, anything unverified as
       `load=~N` (unknown backends, or a `0` that could equally mean idle
@@ -48,8 +51,28 @@ and gathers them behind a **single endpoint**.
      balancer routes on (`{models: [{id, backends: [{ip, port, load, exact}]}]}`).
    - `GET /api/hive/queries?limit=100` → last query-log entries, newest first.
 
-Browser UIs talk to the hive with CORS enabled by default (`--cors-origin`,
-default `"*"`, empty disables).
+## Security
+
+- `--api-key` (or `HIVLLM_API_KEY`, preferred: flags show in `ps`) requires
+  `Authorization: Bearer <key>` on every route except `/health`. Set it
+  whenever the hive is reachable beyond localhost — the query log holds
+  every prompt and response.
+- The client's `Authorization` header is **not** forwarded to backends
+  (it would reach every candidate). `--forward-auth` restores passthrough;
+  with `--api-key`, that forwards the hive key itself.
+- CORS (`--cors-origin`) defaults to `local`: only pages served from
+  `localhost` / `127.0.0.1` / `[::1]` (any port) may call the hive from a
+  browser. Pass a comma-separated origin list for a UI hosted elsewhere,
+  `*` for any site (then any web page you visit can read the query log),
+  or `""` to disable.
+
+## Timeouts
+
+- `--connect-timeout` (default 5s): a dead host fails over quickly.
+- `--read-timeout` (default 600s, 0 = none): longest silence tolerated
+  from a backend. There is no total timeout, so a stream is never cut
+  while tokens keep flowing — but non-streaming backends stay silent
+  until the whole generation is done, so this caps those.
 
 ## Run
 
@@ -138,7 +161,20 @@ separate fields, merged `response.tool_calls`, plus the raw payload
 a `chunks` count instead). Tool *results* (role `"tool"`) travel in later
 client requests, already logged in full under `request`.
 
-Cap log size with a truncation strategy:
+The log rolls by size: once `hivllm-queries.jsonl` would exceed
+`--log-max-mb` (default 100 MiB, 0 = never), it is renamed to
+`hivllm-queries.<UTC timestamp>.jsonl`, gzipped in the background
+(`--log-compress false` to keep plain files) and only the newest
+`--log-keep` archives stay (default 20, 0 = all). Entries are never cut by
+rolling, and `/api/hive/queries` reads through archives when the live file
+is short. Read archives back with `zcat`:
+
+```bash
+zcat hivllm-queries.*.jsonl.gz | jq -c '{ts, model, status}'
+cargo run -- --log-max-mb 500 --log-keep 50
+```
+
+Cap entry size with a truncation strategy:
 
 ```bash
 cargo run -- --log-truncate chars --log-max-chars 500

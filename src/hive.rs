@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::{Duration, Instant},
 };
 use tokio::sync::{oneshot, Mutex, RwLock};
@@ -27,9 +27,12 @@ use crate::discovery::{
 use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
 use crate::logging::{
-    extract_response, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
+    extract_response, read_recent, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
     StreamSummary, TeeStream, Truncate,
 };
+
+/// Candidate ordering key: (cooling after a failure, effective load).
+type RankKey = (bool, u64);
 
 #[derive(Clone)]
 pub struct Hive {
@@ -52,24 +55,28 @@ pub struct Hive {
     /// [`Hive::refresh_load`].
     loads: Arc<RwLock<HashMap<(String, String), Load>>>,
     /// base_url → requests currently being served by the hive. Used as a
-    /// load approximation for backends without load tracking.
-    inflight: Arc<Mutex<HashMap<String, u64>>>,
+    /// load approximation for backends without load tracking. Only
+    /// touched through [`InflightGuard`], so cancelled requests can't leak.
+    inflight: Arc<StdMutex<HashMap<String, u64>>>,
+    /// base_url → instant until which the backend is ranked last, set when
+    /// a request to it failed at the transport level. Cooling backends stay
+    /// usable (tried after everyone else), they just stop looking idle.
+    cooldown: Arc<StdMutex<HashMap<String, Instant>>>,
+    /// Forward the client's `Authorization` header to backends (opt-in:
+    /// by default a token never leaves the hive).
+    forward_auth: bool,
     /// Last rendered hive view (change detection for stdout logging).
     last_view: Arc<Mutex<String>>,
     endpoints: Arc<RwLock<Vec<DiscoveredEndpoint>>>,
     /// (model, effective load) -> next index. Equal effective loads rotate
     /// round-robin. All-idle degrades to plain round-robin.
-    rr: Arc<Mutex<HashMap<(String, u64), usize>>>,
+    rr: Arc<Mutex<HashMap<(String, RankKey), usize>>>,
 }
 
 impl Hive {
     pub fn new(own_port: u16) -> Self {
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(300))
-            .build()
-            .expect("reqwest client");
         Self {
-            client,
+            client: upstream_client(DEFAULT_CONNECT_TIMEOUT, Some(DEFAULT_READ_TIMEOUT)),
             own_port,
             own_id: format!("http://127.0.0.1:{own_port}"),
             logger: RequestLogger::new(),
@@ -82,7 +89,9 @@ impl Hive {
             ],
             scoped_probes: vec![Arc::new(HivLoadProbe), Arc::new(VllmMetricsProbe)],
             loads: Arc::new(RwLock::new(HashMap::new())),
-            inflight: Arc::new(Mutex::new(HashMap::new())),
+            inflight: Arc::new(StdMutex::new(HashMap::new())),
+            cooldown: Arc::new(StdMutex::new(HashMap::new())),
+            forward_auth: false,
             last_view: Arc::new(Mutex::new(String::new())),
             endpoints: Arc::new(RwLock::new(Vec::new())),
             rr: Arc::new(Mutex::new(HashMap::new())),
@@ -97,6 +106,20 @@ impl Hive {
     /// Override the Via id (tests serve on ephemeral ports).
     pub fn with_own_id(mut self, id: String) -> Self {
         self.own_id = id;
+        self
+    }
+
+    /// Upstream timeouts: `connect` bounds TCP/TLS setup (fast failover to
+    /// the next candidate), `read` bounds the silence between two reads
+    /// (`None` = wait forever). There is deliberately no total timeout:
+    /// a long generation that keeps streaming is never cut off.
+    pub fn with_timeouts(mut self, connect: Duration, read: Option<Duration>) -> Self {
+        self.client = upstream_client(connect, read);
+        self
+    }
+
+    pub fn with_forward_auth(mut self, forward: bool) -> Self {
+        self.forward_auth = forward;
         self
     }
 
@@ -152,7 +175,7 @@ impl Hive {
     pub async fn aggregate_load(&self, model: Option<&str>) -> (u64, bool) {
         let endpoints = self.endpoints.read().await;
         let loads = self.loads.read().await;
-        let inflight = self.inflight.lock().await;
+        let inflight = lock(&self.inflight);
         let mut exact = Vec::new();
         let mut approx = Vec::new();
         for ep in endpoints.iter() {
@@ -233,20 +256,30 @@ impl Hive {
         self.log_view().await;
     }
 
-    async fn inflight_inc(&self, base_url: &str) {
-        *self
-            .inflight
-            .lock()
-            .await
-            .entry(base_url.to_string())
-            .or_insert(0) += 1;
+    /// Count one request against `base_url` until the guard is dropped.
+    fn track_inflight(&self, base_url: &str) -> InflightGuard {
+        *lock(&self.inflight).entry(base_url.to_string()).or_insert(0) += 1;
+        InflightGuard {
+            inflight: self.inflight.clone(),
+            base_url: base_url.to_string(),
+        }
     }
 
-    async fn inflight_dec(&self, base_url: &str) {
-        let mut inflight = self.inflight.lock().await;
-        if let Some(n) = inflight.get_mut(base_url) {
-            *n = n.saturating_sub(1);
-        }
+    /// Rank `base_url` last for [`FAILURE_COOLDOWN`].
+    fn mark_failed(&self, base_url: &str) {
+        lock(&self.cooldown).insert(base_url.to_string(), Instant::now() + FAILURE_COOLDOWN);
+    }
+
+    fn mark_healthy(&self, base_url: &str) {
+        lock(&self.cooldown).remove(base_url);
+    }
+
+    /// Backends still cooling down after a failure (expired entries pruned).
+    fn cooling(&self) -> HashSet<String> {
+        let now = Instant::now();
+        let mut cooldown = lock(&self.cooldown);
+        cooldown.retain(|_, until| *until > now);
+        cooldown.keys().cloned().collect()
     }
 
     /// Split `http://127.0.0.1:9037` into `("127.0.0.1", Some(9037), "")`;
@@ -273,9 +306,10 @@ impl Hive {
     /// Per-model backends with the SAME effective loads the balancer routes
     /// on. Backs both the stdout view and `GET /api/hive/backends`.
     pub async fn backends_view(&self) -> BackendsView {
+        let cooling = self.cooling();
         let endpoints = self.endpoints.read().await;
         let loads = self.loads.read().await;
-        let inflight = self.inflight.lock().await;
+        let inflight = lock(&self.inflight);
         // model -> rows
         let mut models: HashMap<String, Vec<BackendInfo>> = HashMap::new();
         for ep in endpoints.iter() {
@@ -293,6 +327,7 @@ impl Hive {
                     path,
                     load: num,
                     exact,
+                    cooling: cooling.contains(&ep.base_url),
                 });
             }
         }
@@ -322,19 +357,14 @@ impl Hive {
         }
     }
 
-    /// Last `limit` query-log entries, newest first. Empty when no
-    /// file-backed sink is configured.
+    /// Last `limit` query-log entries, newest first, reaching into rolled
+    /// archives when the live file is short. Empty when no file-backed
+    /// sink is configured.
     pub async fn recent_queries(&self, limit: usize) -> Vec<Value> {
         let Some(path) = self.logger.file_sink_path() else {
             return Vec::new();
         };
-        let content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
-        content
-            .lines()
-            .rev()
-            .take(limit)
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect()
+        read_recent(&path, limit).await
     }
 
     /// Render the per-model hive view: for each model, every backend with
@@ -364,6 +394,9 @@ impl Hive {
                 } else {
                     out.push_str(&format!("\n    {where_} load=~{}", b.load));
                 }
+                if b.cooling {
+                    out.push_str(" (failing, ranked last)");
+                }
             }
         }
         out
@@ -384,42 +417,47 @@ impl Hive {
     /// `max(server_load, hive-observed in-flight)`, so a `/load` stuck at
     /// 0 without server-side tracking degrades to the hive's own signal
     /// instead of pretending the backend is idle. Equal effective loads
-    /// rotate round-robin. The proxy tries candidates in order and fails
-    /// over to the next one when a backend is unreachable.
+    /// rotate round-robin. Backends that just failed a request go last
+    /// (an unreachable backend reports no load, so it would otherwise look
+    /// idle and be tried first). The proxy tries candidates in order and
+    /// fails over to the next one when a backend is unreachable.
     pub async fn candidates(&self, model: &str) -> Vec<String> {
+        let cooling = self.cooling();
         let endpoints = self.endpoints.read().await;
         let loads = self.loads.read().await;
-        let inflight = self.inflight.lock().await;
-        let mut ranked: Vec<(String, u64)> = Vec::new();
-        for ep in endpoints
-            .iter()
-            .filter(|e| e.models.iter().any(|m| m == model))
-        {
-            let server = loads
-                .get(&(ep.id.clone(), model.to_string()))
-                .copied()
-                .unwrap_or(Load::Unknown);
-            let flying = inflight.get(&ep.base_url).copied().unwrap_or(0);
-            let (eff, _) = effective_load(server, flying);
-            ranked.push((ep.base_url.clone(), eff));
-        }
-        drop(inflight);
+        let mut ranked: Vec<(String, RankKey)> = {
+            // Scoped: a std guard must not live across the `rr` await below.
+            let inflight = lock(&self.inflight);
+            endpoints
+                .iter()
+                .filter(|e| e.models.iter().any(|m| m == model))
+                .map(|ep| {
+                    let server = loads
+                        .get(&(ep.id.clone(), model.to_string()))
+                        .copied()
+                        .unwrap_or(Load::Unknown);
+                    let flying = inflight.get(&ep.base_url).copied().unwrap_or(0);
+                    let (eff, _) = effective_load(server, flying);
+                    (ep.base_url.clone(), (cooling.contains(&ep.base_url), eff))
+                })
+                .collect()
+        };
         drop(loads);
         drop(endpoints);
         ranked.sort_by_key(|(_, n)| *n); // stable: ties keep discovery order
         let mut rr = self.rr.lock().await;
         let mut out = Vec::with_capacity(ranked.len());
-        // Rotate each run of equal effective load independently.
+        // Rotate each run of equal (cooling, effective load) independently.
         let mut i = 0;
         while i < ranked.len() {
-            let load = ranked[i].1;
+            let key = ranked[i].1;
             let mut j = i + 1;
-            while j < ranked.len() && ranked[j].1 == load {
+            while j < ranked.len() && ranked[j].1 == key {
                 j += 1;
             }
             let group = &mut ranked[i..j];
             if group.len() > 1 {
-                let counter = rr.entry((model.to_string(), load)).or_insert(0);
+                let counter = rr.entry((model.to_string(), key)).or_insert(0);
                 let rot = *counter % group.len();
                 *counter = counter.wrapping_add(1);
                 group.rotate_left(rot);
@@ -466,6 +504,9 @@ pub struct BackendInfo {
     pub path: String,
     pub load: u64,
     pub exact: bool,
+    /// A recent request failed at the transport level: ranked last until
+    /// the cooldown expires or a request succeeds.
+    pub cooling: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -531,6 +572,43 @@ fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
         }
     }
     body.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// Upstream connect timeout default: a dead host fails over in seconds.
+pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Upstream read (idle) timeout default. Non-streaming backends stay
+/// silent until the whole generation is done, so this also caps how long
+/// a non-streaming generation may take.
+pub const DEFAULT_READ_TIMEOUT: Duration = Duration::from_secs(600);
+/// How long a backend that failed a request stays ranked last.
+const FAILURE_COOLDOWN: Duration = Duration::from_secs(15);
+
+fn upstream_client(connect: Duration, read: Option<Duration>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder().connect_timeout(connect);
+    if let Some(read) = read {
+        builder = builder.read_timeout(read);
+    }
+    builder.build().expect("reqwest client")
+}
+
+/// Poison-tolerant lock: these maps hold plain counters, always valid.
+fn lock<T>(m: &StdMutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// One request counted against a backend's in-flight load; the count is
+/// released on drop, whichever way the request ends.
+struct InflightGuard {
+    inflight: Arc<StdMutex<HashMap<String, u64>>>,
+    base_url: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Some(n) = lock(&self.inflight).get_mut(&self.base_url) {
+            *n = n.saturating_sub(1);
+        }
+    }
 }
 
 fn json_error(status: StatusCode, message: String) -> Response {
@@ -741,9 +819,12 @@ async fn proxy_by_model(
     let stream_mode = value.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     let fwd_body = serde_json::to_vec(&value).unwrap_or_default();
 
-    // Passthrough Authorization if caller provided one.
+    // The client's token is only passed on when the operator opted in:
+    // otherwise it would reach every candidate (random discovered ports,
+    // remote static hosts, containers), not just the one it was meant for.
     let auth: Option<String> = headers
         .get(axum::http::header::AUTHORIZATION)
+        .filter(|_| hive.forward_auth)
         .and_then(|v| v.to_str().ok())
         .map(|s| s.to_string());
 
@@ -756,7 +837,9 @@ async fn proxy_by_model(
     let fwd_via = fwd_path.join(", ");
 
     // Try candidates in load order; an unreachable backend fails over to
-    // the next one instead of failing the request.
+    // the next one instead of failing the request. A timeout does NOT fail
+    // over: the backend accepted the request and may still be generating,
+    // so retrying elsewhere would run the same generation twice.
     let mut last_error = String::new();
     for upstream in &candidates {
         let url = join_upstream_path(upstream, upstream_path);
@@ -770,15 +853,44 @@ async fn proxy_by_model(
             req = req.header(reqwest::header::AUTHORIZATION, a.clone());
         }
 
+        // Counted before sending: non-streaming backends only answer
+        // headers once generation is done, so counting after `send` would
+        // miss the whole busy period. Dropped on every exit path —
+        // including a client disconnect cancelling this handler.
+        let inflight = hive.track_inflight(upstream);
         let resp = match req.send().await {
-            Ok(r) => r,
+            Ok(r) => {
+                hive.mark_healthy(upstream);
+                r
+            }
+            Err(e) if e.is_timeout() && !e.is_connect() => {
+                let msg = format!("upstream `{upstream}` timed out: {e}");
+                tracing::warn!(%url, error = %e, "upstream timed out, not retrying elsewhere");
+                log_query(
+                    &hive,
+                    route,
+                    Outcome {
+                        model,
+                        upstream: Some(upstream.clone()),
+                        stream: stream_mode,
+                        status: StatusCode::GATEWAY_TIMEOUT,
+                        usage: None,
+                        error: Some(msg.clone()),
+                        request: value,
+                        response: None,
+                    },
+                    start,
+                )
+                .await;
+                return json_error(StatusCode::GATEWAY_TIMEOUT, msg);
+            }
             Err(e) => {
                 tracing::warn!(%url, error = %e, "upstream failed, trying next hive member");
+                hive.mark_failed(upstream);
                 last_error = e.to_string();
                 continue;
             }
         };
-        hive.inflight_inc(upstream).await;
 
         let status = StatusCode::from_u16(resp.status().as_u16())
             .unwrap_or(StatusCode::BAD_GATEWAY);
@@ -819,7 +931,7 @@ async fn proxy_by_model(
                     start,
                 )
                 .await;
-                hive2.inflight_dec(&upstream).await;
+                drop(inflight);
             });
             let mut resp_headers = HeaderMap::new();
             resp_headers.insert("Content-Type", "text/event-stream".parse().unwrap());
@@ -827,7 +939,37 @@ async fn proxy_by_model(
             return (status, resp_headers, body).into_response();
         }
 
-        let bytes = resp.bytes().await.unwrap_or_default();
+        // The request was processed: a failed body read is reported, not
+        // retried elsewhere (and never passed off as an empty success).
+        let bytes = match resp.bytes().await {
+            Ok(b) => b,
+            Err(e) => {
+                let (status, what) = if e.is_timeout() {
+                    (StatusCode::GATEWAY_TIMEOUT, "timed out")
+                } else {
+                    (StatusCode::BAD_GATEWAY, "failed")
+                };
+                let msg = format!("reading response from `{upstream}` {what}: {e}");
+                tracing::warn!(%url, error = %e, "upstream response body {what}");
+                log_query(
+                    &hive,
+                    route,
+                    Outcome {
+                        model,
+                        upstream: Some(upstream.clone()),
+                        stream: false,
+                        status,
+                        usage: None,
+                        error: Some(msg.clone()),
+                        request: value,
+                        response: None,
+                    },
+                    start,
+                )
+                .await;
+                return json_error(status, msg);
+            }
+        };
         let parsed = serde_json::from_slice::<Value>(&bytes).ok();
         let usage = parsed
             .as_ref()
@@ -850,7 +992,7 @@ async fn proxy_by_model(
             start,
         )
         .await;
-        hive.inflight_dec(upstream).await;
+        drop(inflight);
         let mut resp_headers = HeaderMap::new();
         resp_headers.insert("Content-Type", "application/json".parse().unwrap());
         return (status, resp_headers, body_from_bytes(bytes)).into_response();
@@ -1044,7 +1186,7 @@ mod tests {
         // Simulate 4 requests the hive is serving on "stuck" right now:
         // a `/load` frozen at 0 must not outrank a truly idle backend.
         for _ in 0..4 {
-            hive.inflight_inc("http://127.0.0.1:9001").await;
+            std::mem::forget(hive.track_inflight("http://127.0.0.1:9001")); // held open
         }
         assert_eq!(hive.candidates("m").await, urls(&[9002, 9001]));
     }
@@ -1100,8 +1242,8 @@ mod tests {
         )
         .await;
         // Simulate 2 hive-observed in-flight requests on the unknown backend.
-        hive.inflight_inc("http://127.0.0.1:9003").await;
-        hive.inflight_inc("http://127.0.0.1:9003").await;
+        std::mem::forget(hive.track_inflight("http://127.0.0.1:9003")); // held open
+        std::mem::forget(hive.track_inflight("http://127.0.0.1:9003")); // held open
         let view = hive.render_view().await;
         let busy = view.find("127.0.0.1:9002 load=7").expect("busy row");
         let approx = view.find("127.0.0.1:9003 load=~2").expect("approx row");
@@ -1128,8 +1270,8 @@ mod tests {
             vec![(("busy", "m"), Load::Known(7))],
         )
         .await;
-        hive.inflight_inc("http://127.0.0.1:9002").await;
-        hive.inflight_inc("http://127.0.0.1:9002").await;
+        std::mem::forget(hive.track_inflight("http://127.0.0.1:9002")); // held open
+        std::mem::forget(hive.track_inflight("http://127.0.0.1:9002")); // held open
         let view = hive.backends_view().await;
         assert_eq!(view.models.len(), 1);
         assert_eq!(view.models[0].id, "m");
@@ -1241,8 +1383,8 @@ mod tests {
             vec![],
         )
         .await;
-        hive.inflight_inc("http://127.0.0.1:9002").await;
-        hive.inflight_inc("http://127.0.0.1:9002").await;
+        std::mem::forget(hive.track_inflight("http://127.0.0.1:9002")); // held open
+        std::mem::forget(hive.track_inflight("http://127.0.0.1:9002")); // held open
         // No exact loads: median of approximations (0, 2) → 1.
         assert_eq!(hive.aggregate_load(None).await, (1, false));
     }
@@ -1370,6 +1512,7 @@ mod tests {
             vec![(("dead", "m"), Load::Known(0)), (("live", "m"), Load::Known(9))],
         )
         .await;
+        let probe = hive.clone();
 
         let app = Router::new()
             .route("/v1/chat/completions", post(chat_completions))
@@ -1389,6 +1532,149 @@ mod tests {
         assert_eq!(resp.status(), 200);
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["id"], "mock-1");
+        // The failure is remembered: the dead backend no longer looks idle.
+        assert_eq!(probe.candidates("m").await, urls(&[live_port, dead_port]));
+        assert!(probe.render_view().await.contains("(failing, ranked last)"));
+    }
+
+    /// Serve `hive` on an ephemeral port with the proxy routes; returns its URL.
+    async fn serve_proxy(hive: Hive) -> String {
+        let app = Router::new()
+            .route("/v1/chat/completions", post(chat_completions))
+            .with_state(hive);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    /// Mock backend answering a canned completion after `delay`; counts hits
+    /// and records the Authorization header it last received.
+    async fn slow_backend(
+        delay: Duration,
+    ) -> (u16, Arc<std::sync::atomic::AtomicUsize>, Arc<StdMutex<Option<String>>>) {
+        let hits = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let auth = Arc::new(StdMutex::new(None));
+        let (h, a) = (hits.clone(), auth.clone());
+        let mock = Router::new().route(
+            "/v1/chat/completions",
+            post(move |headers: HeaderMap| {
+                let (h, a) = (h.clone(), a.clone());
+                async move {
+                    h.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    *lock(&a) = headers
+                        .get("authorization")
+                        .map(|v| v.to_str().unwrap().to_string());
+                    tokio::time::sleep(delay).await;
+                    Json(serde_json::json!({"id": "slow", "choices": []}))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        (port, hits, auth)
+    }
+
+    fn inflight_of(hive: &Hive, port: u16) -> u64 {
+        lock(&hive.inflight)
+            .get(&format!("http://127.0.0.1:{port}"))
+            .copied()
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn inflight_counts_while_non_streaming_upstream_generates() {
+        // Non-streaming backends send headers only when done: the request
+        // must count as in flight for the whole generation, not after it.
+        let (port, hits, _) = slow_backend(Duration::from_millis(1500)).await;
+        let hive = hive_with(vec![ep("a", port, &["m"])], vec![]).await;
+        let url = serve_proxy(hive.clone()).await;
+        let req = tokio::spawn(async move {
+            reqwest::Client::new()
+                .post(format!("{url}/v1/chat/completions"))
+                .json(&serde_json::json!({"model": "m", "messages": []}))
+                .send()
+                .await
+                .unwrap()
+                .status()
+        });
+        // Wait until the backend is working on it, then look.
+        while hits.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(inflight_of(&hive, port), 1);
+        assert_eq!(req.await.unwrap(), 200);
+        assert_eq!(inflight_of(&hive, port), 0);
+    }
+
+    #[tokio::test]
+    async fn client_disconnect_releases_inflight() {
+        let (port, _, _) = slow_backend(Duration::from_secs(3)).await;
+        let hive = hive_with(vec![ep("a", port, &["m"])], vec![]).await;
+        let url = serve_proxy(hive.clone()).await;
+        // Client gives up long before the backend answers.
+        let gave_up = reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .timeout(Duration::from_millis(300))
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await;
+        assert!(gave_up.is_err());
+        let mut released = false;
+        for _ in 0..40 {
+            if inflight_of(&hive, port) == 0 {
+                released = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(released, "in-flight count leaked after client disconnect");
+    }
+
+    #[tokio::test]
+    async fn timeout_is_answered_504_without_retrying_elsewhere() {
+        // Slow backend ranks first (lower load); timing out on it must not
+        // re-run the generation on the fast one.
+        let (slow, slow_hits, _) = slow_backend(Duration::from_secs(3)).await;
+        let (fast, fast_hits, _) = slow_backend(Duration::ZERO).await;
+        let hive = hive_with(
+            vec![ep("slow", slow, &["m"]), ep("fast", fast, &["m"])],
+            vec![(("slow", "m"), Load::Known(1)), (("fast", "m"), Load::Known(5))],
+        )
+        .await
+        .with_timeouts(Duration::from_secs(1), Some(Duration::from_millis(300)));
+        let url = serve_proxy(hive).await;
+        let resp = reqwest::Client::new()
+            .post(format!("{url}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 504);
+        assert_eq!(slow_hits.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert_eq!(fast_hits.load(std::sync::atomic::Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn authorization_is_forwarded_only_when_opted_in() {
+        for forward in [false, true] {
+            let (port, _, seen) = slow_backend(Duration::ZERO).await;
+            let hive = hive_with(vec![ep("a", port, &["m"])], vec![])
+                .await
+                .with_forward_auth(forward);
+            let url = serve_proxy(hive).await;
+            let resp = reqwest::Client::new()
+                .post(format!("{url}/v1/chat/completions"))
+                .bearer_auth("secret")
+                .json(&serde_json::json!({"model": "m", "messages": []}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 200);
+            let expected = forward.then(|| "Bearer secret".to_string());
+            assert_eq!(*lock(&seen), expected, "forward_auth={forward}");
+        }
     }
 
     #[tokio::test]

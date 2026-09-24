@@ -18,6 +18,10 @@ mod load;
 mod logging;
 
 use axum::{
+    extract::Request,
+    http::{header, HeaderValue, StatusCode},
+    middleware::Next,
+    response::{IntoResponse, Response},
     routing::{get, post},
     Router,
 };
@@ -30,7 +34,7 @@ use std::{
 use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
 
 use hive::Hive;
-use logging::{JsonLinesSink, RequestLogger};
+use logging::{JsonLinesSink, RequestLogger, Rotation};
 
 /// Query-log output format. Only `jsonl` is implemented today —
 /// `yaml` (and Langfuse/Logfire API sinks) plug into the same
@@ -100,8 +104,48 @@ struct Args {
     #[arg(long, default_value_t = 2000)]
     log_max_chars: usize,
 
-    /// CORS allowed origin for browser UIs ("*" = any; empty = disabled)
-    #[arg(long, default_value = "*")]
+    /// Roll the query log once it would exceed this many MiB
+    /// (0 = never roll). Rolled files are timestamped next to the log.
+    #[arg(long, default_value_t = 100)]
+    log_max_mb: u64,
+
+    /// Rolled query-log archives to keep (0 = keep all)
+    #[arg(long, default_value_t = 20)]
+    log_keep: usize,
+
+    /// Gzip rolled query-log archives
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    log_compress: bool,
+
+    /// Upstream connect timeout in seconds (a dead backend fails over
+    /// to the next candidate after this)
+    #[arg(long, default_value_t = 5)]
+    connect_timeout: u64,
+
+    /// Upstream read timeout in seconds: longest silence tolerated from a
+    /// backend (0 = none). Non-streaming backends answer only once the
+    /// generation is done, so this also caps non-streaming generations;
+    /// streams are never cut while tokens keep flowing.
+    #[arg(long, default_value_t = 600)]
+    read_timeout: u64,
+
+    /// Require `Authorization: Bearer <key>` on every route but /health.
+    /// Prefer the env var: flags are visible in `ps`.
+    #[arg(long, env = "HIVLLM_API_KEY", hide_env_values = true, default_value = "")]
+    api_key: String,
+
+    /// Forward the client's `Authorization` header to backends. Off by
+    /// default: the token would reach every candidate backend. With
+    /// --api-key, that forwards the hive key itself (fine when the whole
+    /// fleet shares it).
+    #[arg(long)]
+    forward_auth: bool,
+
+    /// CORS allowed origins for browser UIs: "local" = pages served from
+    /// localhost / 127.0.0.1 / [::1] on any port; "*" = any site (lets any
+    /// web page you visit read the query log); a comma-separated origin
+    /// list; empty = disabled.
+    #[arg(long, default_value = "local")]
     cors_origin: String,
 }
 
@@ -120,14 +164,34 @@ async fn main() -> anyhow::Result<()> {
         RequestLogger::new()
     } else {
         let sink: Arc<dyn logging::LogSink> = match args.log_format {
-            LogFormat::Jsonl => Arc::new(JsonLinesSink::open(&args.log_file).await?),
+            LogFormat::Jsonl => Arc::new(
+                JsonLinesSink::open_with(
+                    &args.log_file,
+                    Rotation {
+                        max_bytes: args.log_max_mb.saturating_mul(1024 * 1024),
+                        keep: args.log_keep,
+                        compress: args.log_compress,
+                    },
+                )
+                .await?,
+            ),
         };
-        tracing::info!(file = %args.log_file, sink = sink.name(), "🐝 query log enabled");
+        tracing::info!(
+            file = %args.log_file,
+            sink = sink.name(),
+            max_mb = args.log_max_mb,
+            keep = args.log_keep,
+            compress = args.log_compress,
+            "🐝 query log enabled"
+        );
         RequestLogger::new().with_sink(sink)
     };
+    let read_timeout = (args.read_timeout > 0).then(|| Duration::from_secs(args.read_timeout));
     let hive = Hive::new(args.port)
         .with_logger(logger)
-        .with_log_options(args.log_truncate, args.log_max_chars);
+        .with_log_options(args.log_truncate, args.log_max_chars)
+        .with_timeouts(Duration::from_secs(args.connect_timeout), read_timeout)
+        .with_forward_auth(args.forward_auth);
 
     // Docker socket discovery (opt-in): containers labeled
     // `hivllm.enable=true` join the hive; lifecycle events refresh it.
@@ -194,40 +258,10 @@ async fn main() -> anyhow::Result<()> {
         });
     }
 
-    let mut app = Router::new()
-        .route("/health", get(hive::health))
-        .route("/load", get(hive::server_load))
-        .route("/v1/models", get(hive::list_models))
-        .route("/v1/chat/completions", post(hive::chat_completions))
-        .route("/v1/completions", post(hive::completions))
-        .route("/v1/embeddings", post(hive::embeddings))
-        .route("/api/hive/endpoints", get(hive::list_endpoints))
-        .route("/api/hive/backends", get(hive::list_backends))
-        .route("/api/hive/queries", get(hive::list_queries))
-        .with_state(hive);
-
-    // Browser UIs (HiveChat) need CORS; CLI/curl don't care.
-    if !args.cors_origin.is_empty() {
-        use tower_http::cors::{Any, CorsLayer};
-        let layer = if args.cors_origin == "*" {
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any)
-        } else {
-            match args.cors_origin.parse::<axum::http::HeaderValue>() {
-                Ok(origin) => CorsLayer::new()
-                    .allow_origin(origin)
-                    .allow_methods(Any)
-                    .allow_headers(Any),
-                Err(e) => {
-                    tracing::warn!(%e, "invalid --cors-origin, CORS disabled");
-                    CorsLayer::new()
-                }
-            }
-        };
-        app = app.layer(layer);
+    if args.api_key.is_empty() && !args.bind.is_loopback() {
+        tracing::warn!(bind = %args.bind, "hive exposed without --api-key: anyone who can reach it can use every model and read the query log");
     }
+    let app = build_router(hive, &args.cors_origin, &args.api_key);
 
     let addr = SocketAddr::from((args.bind, args.port));
     tracing::info!("🐝 HivLLM hive listening on http://{addr}");
@@ -241,7 +275,177 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// All routes, behind API-key auth (when a key is set) and CORS (outermost,
+/// so preflights are answered before auth).
+fn build_router(hive: Hive, cors_origin: &str, api_key: &str) -> Router {
+    let mut app = Router::new()
+        .route("/health", get(hive::health))
+        .route("/load", get(hive::server_load))
+        .route("/v1/models", get(hive::list_models))
+        .route("/v1/chat/completions", post(hive::chat_completions))
+        .route("/v1/completions", post(hive::completions))
+        .route("/v1/embeddings", post(hive::embeddings))
+        .route("/api/hive/endpoints", get(hive::list_endpoints))
+        .route("/api/hive/backends", get(hive::list_backends))
+        .route("/api/hive/queries", get(hive::list_queries))
+        .with_state(hive);
+
+    if !api_key.is_empty() {
+        let expected: Arc<[u8]> = format!("Bearer {api_key}").into_bytes().into();
+        app = app.layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+            let expected = expected.clone();
+            async move { require_api_key(&expected, req, next).await }
+        }));
+    }
+    if let Some(cors) = cors_layer(cors_origin) {
+        app = app.layer(cors);
+    }
+    app
+}
+
+async fn require_api_key(expected: &[u8], req: Request, next: Next) -> Response {
+    // Container healthchecks carry no credentials.
+    if req.uri().path() == "/health" {
+        return next.run(req).await;
+    }
+    let presented = req
+        .headers()
+        .get(header::AUTHORIZATION)
+        .map(|v| v.as_bytes())
+        .unwrap_or_default();
+    if constant_time_eq(presented, expected) {
+        return next.run(req).await;
+    }
+    let body = serde_json::json!({
+        "error": { "message": "missing or invalid API key", "type": "hive_error" }
+    });
+    (StatusCode::UNAUTHORIZED, axum::Json(body)).into_response()
+}
+
+/// Compare without leaking the position of the first mismatch.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
+/// Browser pages served from this machine, any port.
+fn is_local_origin(origin: &HeaderValue) -> bool {
+    let Ok(origin) = origin.to_str() else {
+        return false;
+    };
+    let Some(rest) = origin
+        .strip_prefix("http://")
+        .or_else(|| origin.strip_prefix("https://"))
+    else {
+        return false;
+    };
+    let host = match rest.strip_prefix("[::1]") {
+        Some(port) => return port.is_empty() || port.starts_with(':'),
+        None => rest.split(':').next().unwrap_or(rest),
+    };
+    host == "localhost" || host == "127.0.0.1"
+}
+
+fn cors_layer(spec: &str) -> Option<tower_http::cors::CorsLayer> {
+    use tower_http::cors::{AllowHeaders, AllowOrigin, Any, CorsLayer};
+    let origin = match spec.trim() {
+        "" => return None,
+        "*" => AllowOrigin::any(),
+        "local" => AllowOrigin::predicate(|o, _| is_local_origin(o)),
+        list => {
+            let origins: Vec<HeaderValue> = list
+                .split(',')
+                .map(str::trim)
+                .filter(|o| !o.is_empty())
+                .filter_map(|o| match o.parse() {
+                    Ok(v) => Some(v),
+                    Err(e) => {
+                        tracing::warn!(origin = o, %e, "invalid --cors-origin entry, skipped");
+                        None
+                    }
+                })
+                .collect();
+            if origins.is_empty() {
+                return None;
+            }
+            AllowOrigin::list(origins)
+        }
+    };
+    // Mirrored, not `*`: browsers never let a wildcard cover `Authorization`.
+    Some(
+        CorsLayer::new()
+            .allow_origin(origin)
+            .allow_methods(Any)
+            .allow_headers(AllowHeaders::mirror_request()),
+    )
+}
+
 // `anyhow` is used only for main's error type; add it as a tiny dep-free alias.
 mod anyhow {
     pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn local_origins_only() {
+        let ok = |o: &str| is_local_origin(&HeaderValue::from_str(o).unwrap());
+        assert!(ok("http://localhost:5173"));
+        assert!(ok("http://localhost"));
+        assert!(ok("https://127.0.0.1:8443"));
+        assert!(ok("http://[::1]:3000"));
+        assert!(!ok("https://evil.example"));
+        assert!(!ok("http://localhost.evil.example"));
+        assert!(!ok("http://127.0.0.1.evil.example:80"));
+        assert!(!ok("http://[::1].evil"));
+        assert!(!ok("null"));
+    }
+
+    async fn serve(app: Router) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn api_key_guards_everything_but_health() {
+        let url = serve(build_router(Hive::new(0), "local", "k3y")).await;
+        let c = reqwest::Client::new();
+        let get = |path: &str, key: Option<&str>| {
+            let mut r = c.get(format!("{url}{path}"));
+            if let Some(k) = key {
+                r = r.bearer_auth(k);
+            }
+            r.send()
+        };
+        assert_eq!(get("/health", None).await.unwrap().status(), 200);
+        assert_eq!(get("/api/hive/queries", None).await.unwrap().status(), 401);
+        assert_eq!(get("/v1/models", Some("wrong")).await.unwrap().status(), 401);
+        assert_eq!(get("/v1/models", Some("k3y")).await.unwrap().status(), 200);
+    }
+
+    #[tokio::test]
+    async fn cors_answers_local_pages_only_and_allows_authorization() {
+        let url = serve(build_router(Hive::new(0), "local", "k3y")).await;
+        let preflight = |origin: &'static str| {
+            reqwest::Client::new()
+                .request(reqwest::Method::OPTIONS, format!("{url}/api/hive/queries"))
+                .header("Origin", origin)
+                .header("Access-Control-Request-Method", "GET")
+                .header("Access-Control-Request-Headers", "authorization")
+                .send()
+        };
+        let local = preflight("http://localhost:5173").await.unwrap();
+        let h = local.headers();
+        assert_eq!(h["access-control-allow-origin"], "http://localhost:5173");
+        assert!(h["access-control-allow-headers"]
+            .to_str()
+            .unwrap()
+            .contains("authorization"));
+        let evil = preflight("https://evil.example").await.unwrap();
+        assert!(evil.headers().get("access-control-allow-origin").is_none());
+        assert!(cors_layer("").is_none());
+    }
 }
