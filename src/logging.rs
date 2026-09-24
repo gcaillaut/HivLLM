@@ -42,7 +42,8 @@ pub struct LogEntry {
     pub stream: bool,
     pub status: u16,
     pub latency_ms: u64,
-    /// Token usage reported by upstream (non-streaming responses only).
+    /// Token usage reported by upstream (streams: when sent in-stream, e.g.
+    /// chat with `stream_options.include_usage`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub usage: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -61,6 +62,8 @@ pub struct LogEntry {
 /// `delta.reasoning[_content]`, not in `content`). Assistant `tool_calls`
 /// are merged into one array; tool *results* (role `"tool"`) travel in
 /// later client requests, which are logged in full under `request`.
+/// Top-level fields describe the first choice; with `n > 1` the others
+/// land in `other_choices`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct LoggedResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -71,12 +74,40 @@ pub struct LoggedResponse {
     pub tool_calls: Vec<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub finish_reason: Option<String>,
+    /// Choices after the first (`n > 1`), same fields.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub other_choices: Vec<LoggedChoice>,
     /// SSE chunks seen (streaming responses only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub chunks: Option<u64>,
     /// Complete upstream payload (non-streaming responses only).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub raw: Option<Value>,
+}
+
+/// One extra choice of an `n > 1` response.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct LoggedChoice {
+    pub index: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub tool_calls: Vec<Value>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finish_reason: Option<String>,
+}
+
+impl LoggedChoice {
+    fn truncated(mut self, max_chars: usize) -> Self {
+        self.content = self.content.map(|c| truncate_text(&c, max_chars));
+        self.reasoning = self.reasoning.map(|r| truncate_text(&r, max_chars));
+        for tc in &mut self.tool_calls {
+            truncate_strings(tc, max_chars);
+        }
+        self
+    }
 }
 
 impl LoggedResponse {
@@ -93,56 +124,105 @@ impl LoggedResponse {
         for tc in &mut self.tool_calls {
             truncate_strings(tc, max_chars);
         }
+        self.other_choices = std::mem::take(&mut self.other_choices)
+            .into_iter()
+            .map(|c| c.truncated(max_chars))
+            .collect();
         if let Some(raw) = self.raw.take() {
             self.raw = Some(truncate_value(raw, strategy, max_chars));
         }
         self
     }
+
+    fn set_first(&mut self, c: LoggedChoice) {
+        self.content = c.content;
+        self.reasoning = c.reasoning;
+        self.tool_calls = c.tool_calls;
+        self.finish_reason = c.finish_reason;
+    }
+}
+
+fn str_field(v: &Value, key: &str) -> Option<String> {
+    v.get(key).and_then(Value::as_str).map(str::to_string)
+}
+
+/// One chat (`message.*`) or legacy completions (`text`) choice.
+fn extract_choice(index: u64, choice: &Value) -> LoggedChoice {
+    let mut out = LoggedChoice {
+        index,
+        finish_reason: str_field(choice, "finish_reason"),
+        ..Default::default()
+    };
+    if let Some(msg) = choice.get("message") {
+        out.content = str_field(msg, "content");
+        out.reasoning = str_field(msg, "reasoning").or_else(|| str_field(msg, "reasoning_content"));
+        out.tool_calls = msg
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+    }
+    if out.content.is_none() {
+        out.content = str_field(choice, "text");
+    }
+    out
+}
+
+/// A Responses API object (`POST /v1/responses`): text from `message`
+/// items' `output_text` parts, reasoning from `reasoning` items, and
+/// `function_call` items as tool calls.
+fn extract_responses_output(body: &Value) -> Option<LoggedChoice> {
+    let output = body.get("output")?.as_array()?;
+    let (mut content, mut reasoning, mut tool_calls) = (String::new(), String::new(), Vec::new());
+    for item in output {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                for part in item.get("content").and_then(Value::as_array).into_iter().flatten() {
+                    if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                        content.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+                    }
+                }
+            }
+            Some("reasoning") => {
+                for key in ["content", "summary"] {
+                    for part in item.get(key).and_then(Value::as_array).into_iter().flatten() {
+                        reasoning.push_str(part.get("text").and_then(Value::as_str).unwrap_or(""));
+                    }
+                }
+            }
+            Some("function_call") => tool_calls.push(item.clone()),
+            _ => {}
+        }
+    }
+    Some(LoggedChoice {
+        index: 0,
+        content: some_if_nonempty(content),
+        reasoning: some_if_nonempty(reasoning),
+        tool_calls,
+        finish_reason: str_field(body, "status"),
+    })
 }
 
 /// Extract a [`LoggedResponse`] from a complete (non-streaming) upstream
-/// JSON payload. Handles chat completions
-/// (`choices[].message.{content,reasoning,tool_calls}`) and legacy text
-/// completions (`choices[].text`). Embeddings keep their vector in `raw`.
+/// JSON payload: chat completions (`choices[].message.*`), legacy text
+/// completions (`choices[].text`) and Responses API objects (`output[]`).
+/// Embeddings, rerank scores etc. keep their payload in `raw`.
 pub fn extract_response(body: &Value) -> LoggedResponse {
     let mut out = LoggedResponse {
         raw: Some(body.clone()),
         ..Default::default()
     };
-    let first_choice = body
-        .get("choices")
-        .and_then(|c| c.as_array())
-        .and_then(|a| a.first());
-    if let Some(choice) = first_choice {
-        if let Some(msg) = choice.get("message") {
-            out.content = msg
-                .get("content")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-            out.reasoning = msg
-                .get("reasoning")
-                .and_then(|v| v.as_str())
-                .or_else(|| {
-                    msg.get("reasoning_content")
-                        .and_then(|v| v.as_str())
-                })
-                .map(str::to_string);
-            out.tool_calls = msg
-                .get("tool_calls")
-                .and_then(|v| v.as_array())
-                .cloned()
-                .unwrap_or_default();
+    if let Some(choices) = body.get("choices").and_then(Value::as_array) {
+        let mut all = choices.iter().enumerate().map(|(i, c)| {
+            let index = c.get("index").and_then(Value::as_u64).unwrap_or(i as u64);
+            extract_choice(index, c)
+        });
+        if let Some(first) = all.next() {
+            out.set_first(first);
         }
-        if out.content.is_none() {
-            out.content = choice
-                .get("text")
-                .and_then(|v| v.as_str())
-                .map(str::to_string);
-        }
-        out.finish_reason = choice
-            .get("finish_reason")
-            .and_then(|v| v.as_str())
-            .map(str::to_string);
+        out.other_choices = all.collect();
+    } else if let Some(first) = extract_responses_output(body) {
+        out.set_first(first);
     }
     out
 }
@@ -189,24 +269,56 @@ pub fn truncate_value(mut v: Value, strategy: Truncate, max_chars: usize) -> Val
 
 // ---------- streaming accumulation ----------
 
-/// Incrementally rebuilt response while SSE chunks flow through.
-#[derive(Debug, Default)]
-pub struct StreamAcc {
-    buf: Vec<u8>,
+/// Longest SSE line buffered while waiting for its newline. A misbehaving
+/// upstream that never sends one can't grow memory without bound: the
+/// line is discarded (the client still gets every byte).
+const MAX_SSE_LINE: usize = 4 * 1024 * 1024;
+
+/// One choice being rebuilt from its deltas.
+#[derive(Debug, Default, Clone)]
+struct ChoiceAcc {
     content: String,
     reasoning: String,
     tool_calls: HashMap<u32, Value>,
     finish_reason: Option<String>,
+}
+
+impl ChoiceAcc {
+    fn logged(&self, index: u64) -> LoggedChoice {
+        let mut idx: Vec<u32> = self.tool_calls.keys().copied().collect();
+        idx.sort_unstable();
+        LoggedChoice {
+            index,
+            content: some_if_nonempty(self.content.clone()),
+            reasoning: some_if_nonempty(self.reasoning.clone()),
+            tool_calls: idx.iter().filter_map(|i| self.tool_calls.get(i).cloned()).collect(),
+            finish_reason: self.finish_reason.clone(),
+        }
+    }
+}
+
+/// Incrementally rebuilt response while SSE chunks flow through: chat /
+/// completions chunks per choice index, or Responses API events.
+#[derive(Debug, Default)]
+pub struct StreamAcc {
+    buf: Vec<u8>,
+    /// Discarding an over-long line until its newline.
+    skipping_line: bool,
+    choices: std::collections::BTreeMap<u64, ChoiceAcc>,
+    usage: Option<Value>,
+    /// Transport error that cut the stream short, if any.
+    error: Option<String>,
     chunks: u64,
 }
 
 #[derive(Debug, Default)]
 pub struct StreamSummary {
-    pub content: String,
-    pub reasoning: String,
-    pub tool_calls: Vec<Value>,
-    pub finish_reason: Option<String>,
-    pub chunks: u64,
+    pub response: LoggedResponse,
+    /// Token usage, when the upstream reports it in-stream (chat with
+    /// `stream_options.include_usage`, Responses `response.completed`).
+    pub usage: Option<Value>,
+    /// The stream broke mid-way (e.g. read timeout).
+    pub error: Option<String>,
 }
 
 fn some_if_nonempty(s: String) -> Option<String> {
@@ -219,30 +331,101 @@ fn some_if_nonempty(s: String) -> Option<String> {
 
 impl StreamAcc {
     pub fn summary(&self) -> StreamSummary {
-        let mut idx: Vec<u32> = self.tool_calls.keys().copied().collect();
-        idx.sort_unstable();
+        let mut response = LoggedResponse {
+            chunks: Some(self.chunks),
+            ..Default::default()
+        };
+        let mut all = self.choices.iter().map(|(i, c)| c.logged(*i));
+        if let Some(first) = all.next() {
+            response.set_first(first);
+        }
+        response.other_choices = all.collect();
         StreamSummary {
-            content: self.content.clone(),
-            reasoning: self.reasoning.clone(),
-            tool_calls: idx
-                .iter()
-                .filter_map(|i| self.tool_calls.get(i).cloned())
-                .collect(),
-            finish_reason: self.finish_reason.clone(),
-            chunks: self.chunks,
+            response,
+            usage: self.usage.clone(),
+            error: self.error.clone(),
         }
     }
-}
 
-impl StreamSummary {
-    pub fn into_response(self) -> LoggedResponse {
-        LoggedResponse {
-            content: some_if_nonempty(self.content),
-            reasoning: some_if_nonempty(self.reasoning),
-            tool_calls: self.tool_calls,
-            finish_reason: self.finish_reason,
-            chunks: Some(self.chunks),
-            raw: None,
+    /// Record a transport error that ended the stream.
+    pub fn fail(&mut self, error: String) {
+        self.error.get_or_insert(error);
+    }
+
+    fn choice(&mut self, index: u64) -> &mut ChoiceAcc {
+        self.choices.entry(index).or_default()
+    }
+
+    fn apply(&mut self, v: &Value) {
+        if let Some(usage) = v.get("usage").filter(|u| !u.is_null()) {
+            self.usage = Some(usage.clone());
+        }
+        if let Some(kind) = v.get("type").and_then(Value::as_str) {
+            self.apply_responses_event(kind, v);
+            return;
+        }
+        let choices = v.get("choices").and_then(Value::as_array).cloned().unwrap_or_default();
+        for (i, choice) in choices.iter().enumerate() {
+            let index = choice.get("index").and_then(Value::as_u64).unwrap_or(i as u64);
+            let acc = self.choice(index);
+            if let Some(delta) = choice.get("delta") {
+                if let Some(s) = delta.get("content").and_then(Value::as_str) {
+                    acc.content.push_str(s);
+                }
+                if let Some(s) = delta
+                    .get("reasoning")
+                    .and_then(Value::as_str)
+                    .or_else(|| delta.get("reasoning_content").and_then(Value::as_str))
+                {
+                    acc.reasoning.push_str(s);
+                }
+                merge_tool_calls(&mut acc.tool_calls, delta.get("tool_calls"));
+            }
+            // Legacy completions stream `text` instead of a delta.
+            if let Some(s) = choice.get("text").and_then(Value::as_str) {
+                acc.content.push_str(s);
+            }
+            if let Some(fr) = choice.get("finish_reason").and_then(Value::as_str) {
+                acc.finish_reason = Some(fr.to_string());
+            }
+        }
+    }
+
+    /// Responses API streaming events.
+    fn apply_responses_event(&mut self, kind: &str, v: &Value) {
+        let delta = v.get("delta").and_then(Value::as_str).unwrap_or("");
+        match kind {
+            "response.output_text.delta" => self.choice(0).content.push_str(delta),
+            "response.reasoning_text.delta" | "response.reasoning_summary_text.delta" => {
+                self.choice(0).reasoning.push_str(delta)
+            }
+            "response.completed" | "response.incomplete" | "response.failed" => {
+                let Some(resp) = v.get("response") else { return };
+                if let Some(usage) = resp.get("usage").filter(|u| !u.is_null()) {
+                    self.usage = Some(usage.clone());
+                }
+                // The final object is authoritative: take what deltas missed
+                // (function calls stream their arguments piecemeal).
+                if let Some(done) = extract_responses_output(resp) {
+                    let acc = self.choice(0);
+                    if acc.content.is_empty() {
+                        acc.content = done.content.unwrap_or_default();
+                    }
+                    if acc.reasoning.is_empty() {
+                        acc.reasoning = done.reasoning.unwrap_or_default();
+                    }
+                    if acc.tool_calls.is_empty() {
+                        acc.tool_calls = done
+                            .tool_calls
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, t)| (i as u32, t))
+                            .collect();
+                    }
+                    acc.finish_reason = done.finish_reason;
+                }
+            }
+            _ => {}
         }
     }
 }
@@ -298,8 +481,21 @@ fn merge_tool_calls(slots: &mut HashMap<u32, Value>, deltas: Option<&Value>) {
 /// Feed raw SSE bytes; complete `data:` lines update the accumulator.
 pub fn feed_sse(acc: &mut StreamAcc, bytes: &[u8]) {
     acc.buf.extend_from_slice(bytes);
-    while let Some(pos) = acc.buf.iter().position(|&b| b == b'\n') {
+    loop {
+        let Some(pos) = acc.buf.iter().position(|&b| b == b'\n') else {
+            if acc.buf.len() > MAX_SSE_LINE {
+                if !acc.skipping_line {
+                    tracing::warn!(limit = MAX_SSE_LINE, "over-long SSE line not logged");
+                }
+                acc.skipping_line = true;
+                acc.buf.clear();
+            }
+            return;
+        };
         let line: Vec<u8> = acc.buf.drain(..=pos).collect();
+        if std::mem::take(&mut acc.skipping_line) {
+            continue; // tail of a discarded line
+        }
         let payload = String::from_utf8_lossy(&line)
             .trim()
             .strip_prefix("data:")
@@ -312,29 +508,7 @@ pub fn feed_sse(acc: &mut StreamAcc, bytes: &[u8]) {
             continue;
         };
         acc.chunks += 1;
-        let choices = v
-            .get("choices")
-            .and_then(|c| c.as_array())
-            .cloned()
-            .unwrap_or_default();
-        for choice in &choices {
-            if let Some(delta) = choice.get("delta") {
-                if let Some(s) = delta.get("content").and_then(|v| v.as_str()) {
-                    acc.content.push_str(s);
-                }
-                if let Some(s) = delta
-                    .get("reasoning")
-                    .and_then(|v| v.as_str())
-                    .or_else(|| delta.get("reasoning_content").and_then(|v| v.as_str()))
-                {
-                    acc.reasoning.push_str(s);
-                }
-                merge_tool_calls(&mut acc.tool_calls, delta.get("tool_calls"));
-            }
-            if let Some(fr) = choice.get("finish_reason").and_then(|v| v.as_str()) {
-                acc.finish_reason = Some(fr.to_string());
-            }
-        }
+        acc.apply(&v);
     }
 }
 
@@ -361,6 +535,7 @@ impl<S> TeeStream<S> {
 impl<S, E> Stream for TeeStream<S>
 where
     S: Stream<Item = Result<Bytes, E>>,
+    E: std::fmt::Display,
 {
     type Item = Result<Bytes, E>;
 
@@ -381,6 +556,12 @@ where
                     feed_sse(&mut acc, &chunk);
                 }
                 Poll::Ready(Some(Ok(chunk)))
+            }
+            Poll::Ready(Some(Err(e))) => {
+                if let Ok(mut acc) = this.acc.lock() {
+                    acc.fail(e.to_string());
+                }
+                Poll::Ready(Some(Err(e)))
             }
             other => other,
         }
@@ -849,15 +1030,13 @@ mod tests {
         feed_sse(&mut acc, b"data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":1}\"}}]}},{\"finish_reason\":null}]}\n");
         feed_sse(&mut acc, b"data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n");
         feed_sse(&mut acc, b"data: [DONE]\n");
-        let s = acc.summary();
-        assert_eq!(s.content, "Hi");
-        assert_eq!(s.reasoning, "thinking");
-        assert_eq!(s.tool_calls.len(), 1);
-        assert_eq!(s.tool_calls[0]["id"], "c1");
-        assert_eq!(s.tool_calls[0]["function"]["arguments"], "{\"a\":1}");
-        assert_eq!(s.finish_reason.as_deref(), Some("tool_calls"));
-        assert_eq!(s.chunks, 5);
-        let r = s.into_response();
+        let r = acc.summary().response;
+        assert_eq!(r.content.as_deref(), Some("Hi"));
+        assert_eq!(r.reasoning.as_deref(), Some("thinking"));
+        assert_eq!(r.tool_calls.len(), 1);
+        assert_eq!(r.tool_calls[0]["id"], "c1");
+        assert_eq!(r.tool_calls[0]["function"]["arguments"], "{\"a\":1}");
+        assert_eq!(r.finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(r.chunks, Some(5));
         assert!(r.raw.is_none());
     }
@@ -999,5 +1178,97 @@ mod tests {
         // Flush waits for everything queued before it, in order.
         logger.flush().await;
         assert_eq!(*got.lock().unwrap(), vec!["a".to_string(), "b".to_string()]);
+    }
+
+    fn feed_all(lines: &[&str]) -> StreamAcc {
+        let mut acc = StreamAcc::default();
+        for l in lines {
+            feed_sse(&mut acc, format!("data: {l}\n\n").as_bytes());
+        }
+        acc
+    }
+
+    #[test]
+    fn stream_keeps_choices_apart_and_captures_usage() {
+        let acc = feed_all(&[
+            r#"{"choices":[{"index":0,"delta":{"content":"Hel"}},{"index":1,"delta":{"content":"Bon"}}]}"#,
+            r#"{"choices":[{"index":1,"delta":{"content":"jour"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[{"index":0,"delta":{"content":"lo"},"finish_reason":"stop"}]}"#,
+            r#"{"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":4,"total_tokens":7}}"#,
+        ]);
+        let s = acc.summary();
+        assert_eq!(s.response.content.as_deref(), Some("Hello"));
+        assert_eq!(s.response.other_choices.len(), 1);
+        assert_eq!(s.response.other_choices[0].index, 1);
+        assert_eq!(s.response.other_choices[0].content.as_deref(), Some("Bonjour"));
+        assert_eq!(s.usage.unwrap()["total_tokens"], 7);
+    }
+
+    #[test]
+    fn responses_api_stream_is_assembled() {
+        let acc = feed_all(&[
+            r#"{"type":"response.created","response":{"status":"in_progress"}}"#,
+            r#"{"type":"response.reasoning_text.delta","delta":"hmm"}"#,
+            r#"{"type":"response.output_text.delta","delta":"Hi "}"#,
+            r#"{"type":"response.output_text.delta","delta":"there"}"#,
+            r#"{"type":"response.completed","response":{"status":"completed","usage":{"total_tokens":9},"output":[{"type":"function_call","name":"f","arguments":"{}"}]}}"#,
+        ]);
+        let s = acc.summary();
+        assert_eq!(s.response.content.as_deref(), Some("Hi there"));
+        assert_eq!(s.response.reasoning.as_deref(), Some("hmm"));
+        assert_eq!(s.response.tool_calls[0]["name"], "f");
+        assert_eq!(s.response.finish_reason.as_deref(), Some("completed"));
+        assert_eq!(s.usage.unwrap()["total_tokens"], 9);
+    }
+
+    #[test]
+    fn extract_handles_responses_objects_and_extra_choices() {
+        let resp = serde_json::json!({
+            "object": "response", "status": "completed",
+            "output": [
+                {"type": "reasoning", "summary": [{"type": "summary_text", "text": "plan"}]},
+                {"type": "message", "content": [{"type": "output_text", "text": "done"}]}
+            ]
+        });
+        let r = extract_response(&resp);
+        assert_eq!(r.content.as_deref(), Some("done"));
+        assert_eq!(r.reasoning.as_deref(), Some("plan"));
+        let chat = serde_json::json!({"choices": [
+            {"index": 0, "message": {"content": "a"}},
+            {"index": 1, "message": {"content": "b"}, "finish_reason": "length"}
+        ]});
+        let r = extract_response(&chat);
+        assert_eq!(r.content.as_deref(), Some("a"));
+        assert_eq!(r.other_choices[0].content.as_deref(), Some("b"));
+        assert_eq!(r.other_choices[0].finish_reason.as_deref(), Some("length"));
+    }
+
+    #[test]
+    fn over_long_sse_lines_are_dropped_not_buffered() {
+        let mut acc = StreamAcc::default();
+        let junk = vec![b'x'; MAX_SSE_LINE / 2 + 1];
+        feed_sse(&mut acc, &junk);
+        feed_sse(&mut acc, &junk); // over the cap, still no newline
+        assert!(acc.buf.len() <= MAX_SSE_LINE);
+        feed_sse(&mut acc, b"tail of junk\n");
+        feed_sse(&mut acc, b"data: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n");
+        assert_eq!(acc.summary().response.content.as_deref(), Some("ok"));
+    }
+
+    #[tokio::test]
+    async fn tee_stream_records_transport_errors() {
+        use futures::StreamExt;
+        let chunks: Vec<Result<Bytes, String>> = vec![
+            Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n")),
+            Err("connection reset".into()),
+        ];
+        let acc = Arc::new(std::sync::Mutex::new(StreamAcc::default()));
+        let (tx, rx) = oneshot::channel();
+        let tee = TeeStream::new(futures::stream::iter(chunks), acc, tx);
+        let passed: Vec<_> = tee.collect().await;
+        assert_eq!(passed.len(), 2);
+        let s = rx.await.unwrap();
+        assert_eq!(s.response.content.as_deref(), Some("par"));
+        assert_eq!(s.error.as_deref(), Some("connection reset"));
     }
 }

@@ -197,7 +197,12 @@ Each entry carries the full client `request` and the full upstream
 `response` by default: `response.content` and `response.reasoning` in
 separate fields, merged `response.tool_calls`, plus the raw payload
 (`response.raw`, absent for streams — those store the assembled text and
-a `chunks` count instead). Tool *results* (role `"tool"`) travel in later
+a `chunks` count instead). Streams also record `usage` when the upstream
+sends it in-stream (chat with `stream_options.include_usage`, Responses
+API `response.completed`), and a stream broken mid-way (read timeout,
+reset) is logged with `error: "stream broken: …"` and what arrived so far.
+With `n > 1`, the first choice fills the top-level fields and the others
+land in `response.other_choices`. Tool *results* (role `"tool"`) travel in later
 client requests, already logged in full under `request`.
 
 The log rolls by size: once `hivllm-queries.jsonl` would exceed

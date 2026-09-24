@@ -1222,16 +1222,20 @@ async fn proxy_by_model(
             let hive2 = hive.clone();
             let (model, value, upstream) = (model.clone(), value.clone(), upstream.clone());
             tokio::spawn(async move {
-                let (summary, error) = match rx.await {
-                    Ok(s) => (
-                        s,
-                        (!status.is_success()).then(|| format!("upstream status {status}")),
-                    ),
+                let (summary, ended) = match rx.await {
+                    Ok(s) => (s, None),
+                    // Body dropped before its end: the client went away.
                     Err(_) => (
                         acc.lock().map(|a| a.summary()).unwrap_or_default(),
                         Some("stream ended before completion".to_string()),
                     ),
                 };
+                let error = summary
+                    .error
+                    .clone()
+                    .map(|e| format!("stream broken: {e}"))
+                    .or(ended)
+                    .or_else(|| (!status.is_success()).then(|| format!("upstream status {status}")));
                 log_query(
                     &hive2,
                     route,
@@ -1240,10 +1244,10 @@ async fn proxy_by_model(
                         upstream: Some(upstream.clone()),
                         stream: true,
                         status,
-                        usage: None,
+                        usage: summary.usage,
                         error,
                         request: value,
-                        response: Some(summary.into_response()),
+                        response: Some(summary.response),
                     },
                     start,
                 )
@@ -2520,5 +2524,57 @@ mod tests {
             assert_eq!(loads[&("plain".to_string(), m.to_string())], Load::Measured(3));
         }
         assert_eq!(loads[&("peer".to_string(), "m2".to_string())], Load::Measured(7));
+    }
+
+    /// Sink keeping entries in memory.
+    #[derive(Default)]
+    struct Capture(StdMutex<Vec<crate::logging::LogEntry>>);
+
+    impl crate::logging::LogSink for Capture {
+        fn name(&self) -> &'static str {
+            "capture"
+        }
+        fn emit<'a>(&'a self, entry: crate::logging::LogEntry) -> crate::logging::BoxFuture<'a, ()> {
+            lock(&self.0).push(entry);
+            Box::pin(async {})
+        }
+    }
+
+    #[tokio::test]
+    async fn broken_streams_are_logged_with_their_error() {
+        // Backend sends one chunk, then goes silent past the read timeout.
+        let mock = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                let chunks = futures::stream::iter(vec![Ok::<_, std::io::Error>(Bytes::from_static(
+                    b"data: {\"choices\":[{\"delta\":{\"content\":\"half\"}}]}\n\n",
+                ))])
+                .chain(futures::stream::pending());
+                ([("content-type", "text/event-stream")], Body::from_stream(chunks))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+
+        let capture = Arc::new(Capture::default());
+        let hive = hive_with(vec![ep("a", port, &["m"])], vec![])
+            .await
+            .with_timeouts(Duration::from_secs(1), Some(Duration::from_millis(300)))
+            .with_logger(RequestLogger::new().with_sink(capture.clone()));
+        let url = serve_proxy(hive).await;
+        let body = chat(&url, true).await.bytes().await;
+        assert!(body.is_err(), "the client sees the stream break too");
+        let mut entry = None;
+        for _ in 0..50 {
+            if let Some(e) = lock(&capture.0).first().cloned() {
+                entry = Some(e);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let entry = entry.expect("stream logged");
+        assert!(entry.error.as_deref().unwrap_or("").starts_with("stream broken"), "{:?}", entry.error);
+        assert_eq!(entry.response.unwrap().content.as_deref(), Some("half"));
     }
 }
