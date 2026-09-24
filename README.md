@@ -47,6 +47,17 @@ and gathers them behind a **single endpoint**.
      ping-pong forever, across hosts too (answer is 502 `loop detected`
      instead). A hive that discovers itself under another address (static
      URL, LAN IP, container name) skips that endpoint.
+   - **Hive-of-hives model routes (path vector):** in `/v1/models`, each
+     model carries `"hivllm": {"paths": [[hive ids…]]}` — the chains of
+     hives through which it reaches a real backend (`[]` = served
+     directly). A hive probing a peer sends its id as `x-hivllm-via`, and
+     the peer leaves out routes through it; routes through the hive itself
+     are always dropped, and a model with no route left disappears. So
+     hives that discover each other (in pairs or rings) can't keep a dead
+     backend's model alive by re-advertising it: the hive that lost the
+     backend drops it on its next scan, and stale routes elsewhere expire
+     one hop per scan. Requests are never forwarded to a member whose only
+     routes loop back. Paths are capped at 8 hops, 8 routes per model.
    - Streaming (`"stream": true`) SSE is passed through.
 
 3. **Ops**

@@ -23,7 +23,7 @@ use tokio::sync::{oneshot, Mutex, RwLock};
 
 use crate::discovery::{
     discover, join_upstream_path, merge_endpoints, probe_static, DiscoveredEndpoint,
-    HIVE_ID_HEADER,
+    HivModelMeta, HIVE_ID_HEADER, VIA_HEADER,
 };
 use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
@@ -149,30 +149,84 @@ impl Hive {
         static_backends: &[String],
         docker: Option<&DockerDiscovery>,
     ) {
-        let found = discover(&self.client, extra_ports, &[self.own_port]).await;
-        let pinned = probe_static(&self.client, static_backends).await;
+        let me = self.own_id.as_str();
+        let found = discover(&self.client, extra_ports, &[self.own_port], me).await;
+        let pinned = probe_static(&self.client, static_backends, me).await;
         let mut all = merge_endpoints(found, pinned);
         if let Some(d) = docker {
-            let docked = d.container_backends(&self.client).await;
+            let docked = d.container_backends(&self.client, me).await;
             all = merge_endpoints(all, docked);
         }
-        *self.endpoints.write().await = self.without_self(all);
+        self.set_endpoints(all).await;
     }
 
-    /// Drop endpoints that are this very hive reached by another address
-    /// (a static URL, a LAN IP, a container name): the own-port exclusion
-    /// only covers localhost discovery.
+    /// Install a freshly probed member list, minus anything that leads
+    /// back into this hive (see [`Hive::without_self`]).
+    pub async fn set_endpoints(&self, endpoints: Vec<DiscoveredEndpoint>) {
+        *self.endpoints.write().await = self.without_self(endpoints);
+    }
+
+    /// Drop what leads back into this hive:
+    /// - endpoints that ARE this hive reached by another address (a static
+    ///   URL, a LAN IP, a container name) — the own-port exclusion only
+    ///   covers localhost discovery;
+    /// - hive-member paths through this hive, and models left with no
+    ///   other path. Without this, hives that discover each other keep a
+    ///   dead backend's model alive forever by re-advertising it in a
+    ///   cycle.
     fn without_self(&self, endpoints: Vec<DiscoveredEndpoint>) -> Vec<DiscoveredEndpoint> {
+        let me = self.own_id.as_str();
         endpoints
             .into_iter()
             .filter(|ep| {
-                let is_self = ep.hive_id.as_deref() == Some(self.own_id.as_str());
+                let is_self = ep.hive_id.as_deref() == Some(me);
                 if is_self {
                     tracing::debug!(base_url = %ep.base_url, "skipping endpoint: it is this hive");
                 }
                 !is_self
             })
+            .map(|mut ep| {
+                if let Some(hid) = ep.hive_id.clone() {
+                    let models = std::mem::take(&mut ep.models);
+                    for m in models {
+                        let paths: Vec<Vec<String>> = member_paths(&hid, &ep, &m)
+                            .into_iter()
+                            .filter(|p| !p.iter().any(|h| h == me))
+                            .collect();
+                        if paths.is_empty() {
+                            ep.paths.remove(&m);
+                        } else {
+                            ep.paths.insert(m.clone(), paths);
+                            ep.models.push(m);
+                        }
+                    }
+                }
+                ep
+            })
             .collect()
+    }
+
+    /// Paths to advertise for `model` to a requester whose Via path is
+    /// `via`: every route of every member, minus routes through the
+    /// requester's path or this hive, shortest first, capped. Relative to
+    /// this hive (it is not included); `[]` = served by a direct backend.
+    /// Empty = this hive can't serve `model` to that requester.
+    fn advertised_paths(
+        endpoints: &[DiscoveredEndpoint],
+        model: &str,
+        avoid: &HashSet<String>,
+    ) -> Vec<Vec<String>> {
+        let mut out: Vec<Vec<String>> = Vec::new();
+        for ep in endpoints.iter().filter(|e| e.models.iter().any(|m| m == model)) {
+            for p in routes_of(ep, model) {
+                if p.len() < crate::discovery::MAX_HOPS && loop_free(&p, avoid) && !out.contains(&p) {
+                    out.push(p);
+                }
+            }
+        }
+        out.sort_by_key(Vec::len);
+        out.truncate(MAX_ADVERTISED_PATHS);
+        out
     }
 
     pub async fn snapshot(&self) -> Vec<DiscoveredEndpoint> {
@@ -489,10 +543,11 @@ impl Hive {
         out
     }
 
-    /// [`Hive::candidates`] minus already-visited backends: hives whose id
-    /// is on the Via path (or, from pre-id hives, whose base_url is). A
-    /// request that arrives with every backend visited is a loop — the
-    /// proxy answers 502 instead of forwarding forever.
+    /// [`Hive::candidates`] minus backends that lead back to a visited
+    /// hive: members whose id (or, from pre-id hives, whose base_url) is on
+    /// the Via path, and hive members whose every route for `model` runs
+    /// through a visited hive. A request that arrives with nothing left is
+    /// a loop — the proxy answers 502 instead of forwarding forever.
     pub async fn candidates_excluding(
         &self,
         model: &str,
@@ -505,7 +560,7 @@ impl Hive {
             .iter()
             .filter(|ep| {
                 visited.contains(&ep.base_url)
-                    || ep.hive_id.as_ref().is_some_and(|id| visited.contains(id))
+                    || !routes_of(ep, model).iter().any(|p| loop_free(p, visited))
             })
             .map(|ep| ep.base_url.clone())
             .collect();
@@ -559,6 +614,8 @@ struct ModelObject {
     object: &'static str,
     created: u64,
     owned_by: String,
+    /// Routes behind this model, for peer hives (path vector).
+    hivllm: HivModelMeta,
 }
 
 #[derive(Serialize)]
@@ -567,21 +624,32 @@ struct ModelsResponse {
     data: Vec<ModelObject>,
 }
 
-pub async fn list_models(State(hive): State<Hive>) -> impl IntoResponse {
+/// Aggregated model list. A probing hive sends its id as Via: models
+/// it could only reach back through itself are left out, and each model
+/// carries its loop-free routes so peers can do the same one hop further.
+pub async fn list_models(State(hive): State<Hive>, headers: HeaderMap) -> impl IntoResponse {
     let endpoints = hive.snapshot().await;
+    let mut avoid: HashSet<String> = parse_via(&headers).into_iter().collect();
+    avoid.insert(hive.own_id());
     let mut seen = HashSet::new();
     let mut data = Vec::new();
     for ep in &endpoints {
         let owner = ep.name.clone();
         for m in &ep.models {
-            if seen.insert(m.clone()) {
-                data.push(ModelObject {
-                    id: m.clone(),
-                    object: "model",
-                    created: 0,
-                    owned_by: owner.clone(),
-                });
+            if !seen.insert(m.clone()) {
+                continue;
             }
+            let paths = Hive::advertised_paths(&endpoints, m, &avoid);
+            if paths.is_empty() {
+                continue;
+            }
+            data.push(ModelObject {
+                id: m.clone(),
+                object: "model",
+                created: 0,
+                owned_by: owner.clone(),
+                hivllm: HivModelMeta { paths },
+            });
         }
     }
     data.sort_by(|a, b| a.id.cmp(&b.id));
@@ -605,6 +673,31 @@ fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
         }
     }
     body.get("model")?.as_str().map(|s| s.to_string())
+}
+
+/// Most routes advertised per model: shortest first, so a dense mesh
+/// can't blow up the model list.
+const MAX_ADVERTISED_PATHS: usize = 8;
+
+/// Hive-id paths from this hive through `ep` to a real backend of
+/// `model`: `[[]]` for a plain backend (served directly), the member's
+/// recorded paths for a hive (a single opaque hop if none recorded).
+fn routes_of(ep: &DiscoveredEndpoint, model: &str) -> Vec<Vec<String>> {
+    match &ep.hive_id {
+        None => vec![Vec::new()],
+        Some(hid) => member_paths(hid, ep, model),
+    }
+}
+
+fn member_paths(hid: &str, ep: &DiscoveredEndpoint, model: &str) -> Vec<Vec<String>> {
+    ep.paths
+        .get(model)
+        .cloned()
+        .unwrap_or_else(|| vec![vec![hid.to_string()]])
+}
+
+fn loop_free(path: &[String], avoid: &HashSet<String>) -> bool {
+    !path.iter().any(|h| avoid.contains(h))
 }
 
 /// Random instance id: unique per process (the std hasher is seeded from
@@ -694,12 +787,6 @@ fn json_error(status: StatusCode, message: String) -> Response {
     });
     (status, Json(payload)).into_response()
 }
-
-/// Request header carrying the comma-separated instance ids of hives that
-/// already forwarded this request. A hive never forwards to a backend
-/// already on the path — this is what stops hive-of-hives ping-pong
-/// (A strictly prefers B while B strictly prefers A) from looping forever.
-pub const VIA_HEADER: &str = "x-hivllm-via";
 
 /// Ordered, deduplicated Via path from incoming headers.
 fn parse_via(headers: &HeaderMap) -> Vec<String> {
@@ -1168,6 +1255,7 @@ mod tests {
             models: models.iter().map(|s| s.to_string()).collect(),
             source: "test".into(),
             hive_id: None,
+            paths: HashMap::new(),
         }
     }
 
@@ -1532,6 +1620,7 @@ mod tests {
                 models: models.iter().map(|s| s.to_string()).collect(),
                 source: "test".into(),
                 hive_id: None,
+                paths: HashMap::new(),
             }
         }
 
@@ -1783,8 +1872,8 @@ mod tests {
         };
         stub(&ha).await;
         stub(&hb).await;
-        let peer_b = probe_static(&ha.client, std::slice::from_ref(&url_b)).await;
-        let peer_a = probe_static(&hb.client, std::slice::from_ref(&url_a)).await;
+        let peer_b = probe_static(&ha.client, std::slice::from_ref(&url_b), &ha.own_id()).await;
+        let peer_a = probe_static(&hb.client, std::slice::from_ref(&url_a), &hb.own_id()).await;
         assert_eq!(peer_b[0].hive_id.as_deref(), Some(hb.own_id().as_str()));
         assert_eq!(peer_a[0].hive_id.as_deref(), Some(ha.own_id().as_str()));
         *ha.endpoints.write().await = peer_b;
@@ -1819,7 +1908,7 @@ mod tests {
         let app = routes(hive.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         // e.g. `--static-backends http://localhost:8335` on the hive itself.
-        let found = probe_static(&hive.client, &[format!("http://localhost:{port}")]).await;
+        let found = probe_static(&hive.client, &[format!("http://localhost:{port}")], &hive.own_id()).await;
         assert_eq!(found.len(), 1);
         assert!(hive.without_self(found).is_empty());
     }
@@ -1832,5 +1921,134 @@ mod tests {
         assert!(!valid_hive_id("a,b"));
         assert!(!valid_hive_id("a b"));
         assert!(!valid_hive_id(""));
+    }
+
+    /// Mock backend whose `/v1/models` lists "m" while `up` is true.
+    async fn switchable_backend(up: Arc<std::sync::atomic::AtomicBool>) -> String {
+        let mock = Router::new()
+            .route(
+                "/v1/models",
+                get(move || {
+                    let up = up.clone();
+                    async move {
+                        let data = if up.load(std::sync::atomic::Ordering::SeqCst) {
+                            serde_json::json!([{"id": "m"}])
+                        } else {
+                            serde_json::json!([])
+                        };
+                        Json(serde_json::json!({ "data": data }))
+                    }
+                }),
+            )
+            .route(
+                "/v1/chat/completions",
+                post(|| async { Json(serde_json::json!({"id": "real", "choices": []})) }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        url
+    }
+
+    /// Serve a hive with every route; returns its URL.
+    async fn serve_hive(hive: &Hive) -> String {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://localhost:{}", listener.local_addr().unwrap().port());
+        let app = routes(hive.clone());
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        url
+    }
+
+    /// One discovery pass over `statics` only (no localhost port scan).
+    async fn rescan(hive: &Hive, statics: &[String]) {
+        let found = probe_static(&hive.client, statics, &hive.own_id()).await;
+        hive.set_endpoints(found).await;
+    }
+
+    async fn serves_m(hive: &Hive) -> bool {
+        hive.snapshot().await.iter().any(|e| e.models.iter().any(|m| m == "m"))
+    }
+
+    #[tokio::test]
+    async fn dead_model_does_not_survive_in_a_hive_ring() {
+        // Ring A → B → C → A (each probes the next); only A has the real
+        // backend R. Without path vectors each hive would keep re-learning
+        // "m" from its neighbour forever after R drops it.
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let r = switchable_backend(up.clone()).await;
+        let (a, b, c) = (Hive::new(0), Hive::new(0), Hive::new(0));
+        let (ua, ub, uc) = (serve_hive(&a).await, serve_hive(&b).await, serve_hive(&c).await);
+        let round = || async {
+            rescan(&a, &[r.clone(), ub.clone()]).await;
+            rescan(&b, std::slice::from_ref(&uc)).await;
+            rescan(&c, std::slice::from_ref(&ua)).await;
+        };
+        for _ in 0..3 {
+            round().await;
+        }
+        // "m" travelled around: B reaches it through C then A.
+        assert!(serves_m(&b).await);
+        let b_paths = &b.snapshot().await[0].paths["m"];
+        assert_eq!(b_paths, &vec![vec![c.own_id(), a.own_id()]]);
+        // A never learns its own model back through B.
+        assert_eq!(a.candidates("m").await, vec![r.clone()]);
+        // And requests follow the ring to the real backend.
+        let resp = reqwest::Client::new()
+            .post(format!("{ub}/v1/chat/completions"))
+            .json(&serde_json::json!({"model": "m", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.json::<Value>().await.unwrap()["id"], "real");
+
+        // R stops serving "m". A drops it on its next scan; stale routes
+        // elsewhere die one hop per round (B scans C before C rescans A,
+        // so B's two-hop route lingers one extra round) — then never
+        // come back.
+        up.store(false, std::sync::atomic::Ordering::SeqCst);
+        round().await;
+        assert!(!serves_m(&a).await, "the hive that lost the backend must drop it at once");
+        assert!(!serves_m(&c).await);
+        round().await;
+        for _ in 0..3 {
+            for (name, h) in [("a", &a), ("b", &b), ("c", &c)] {
+                assert!(!serves_m(h).await, "hive {name} still serves a dead model");
+            }
+            round().await;
+        }
+    }
+
+    #[test]
+    fn advertised_paths_skip_loops_and_stay_bounded() {
+        let hive_member = |hid: &str, paths: Vec<Vec<&str>>| DiscoveredEndpoint {
+            id: hid.into(),
+            name: hid.into(),
+            base_url: format!("http://{hid}"),
+            models: vec!["m".into()],
+            source: "test".into(),
+            hive_id: Some(hid.into()),
+            paths: HashMap::from([(
+                "m".to_string(),
+                paths
+                    .into_iter()
+                    .map(|p| p.into_iter().map(String::from).collect())
+                    .collect(),
+            )]),
+        };
+        let eps = vec![
+            ep("direct", 9001, &["m"]),
+            hive_member("x", vec![vec!["x"], vec!["x", "req"]]),
+        ];
+        let avoid: HashSet<String> = ["req".to_string(), "me".to_string()].into();
+        // Direct first, then x; the route through the requester is dropped.
+        assert_eq!(
+            Hive::advertised_paths(&eps, "m", &avoid),
+            vec![Vec::<String>::new(), vec!["x".to_string()]]
+        );
+        let many: Vec<DiscoveredEndpoint> = (0..20)
+            .map(|i| hive_member(&format!("h{i}"), vec![vec![&format!("h{i}")]]))
+            .collect();
+        assert_eq!(Hive::advertised_paths(&many, "m", &avoid).len(), MAX_ADVERTISED_PATHS);
     }
 }

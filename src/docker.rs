@@ -54,6 +54,7 @@ impl DockerDiscovery {
     pub async fn container_backends(
         &self,
         client: &reqwest::Client,
+        self_id: &str,
     ) -> Vec<DiscoveredEndpoint> {
         let containers = match self
             .docker
@@ -99,7 +100,7 @@ impl DockerDiscovery {
                     for port in ports {
                         let base_url = format!("http://{name}:{port}");
                         if let Some(probed) =
-                            probe_openai_endpoint(&client, &base_url).await
+                            probe_openai_endpoint(&client, &base_url, self_id).await
                         {
                             return Some(DiscoveredEndpoint {
                                 id: format!("docker-{name}-{port}"),
@@ -108,6 +109,7 @@ impl DockerDiscovery {
                                 models: probed.models,
                                 source: "docker".to_string(),
                                 hive_id: probed.hive_id,
+                                paths: probed.paths,
                             });
                         }
                     }

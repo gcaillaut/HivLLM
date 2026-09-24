@@ -28,7 +28,20 @@ pub struct DiscoveredEndpoint {
     /// (`x-hivllm-id` response header), as it appears on Via paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub hive_id: Option<String>,
+    /// Hive members only: model → the hive-id paths through which this
+    /// member reaches a real backend for it, each starting with the
+    /// member's own id (path vector, see [`hive_paths`]).
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub paths: HashMap<String, Vec<Vec<String>>>,
 }
+
+/// Request header carrying the comma-separated instance ids of hives that
+/// already forwarded this request — or, on a `/v1/models` probe, the id
+/// of the probing hive, so the answer leaves out routes through it.
+pub const VIA_HEADER: &str = "x-hivllm-via";
+
+/// Longest hive path kept: deeper chains are dropped, never trusted.
+pub const MAX_HOPS: usize = 8;
 
 /// Response header every hive stamps with its instance id, so peers can
 /// recognise it whatever address they reach it by.
@@ -40,6 +53,8 @@ pub struct Probed {
     pub models: Vec<String>,
     /// Instance id when the backend is a hive.
     pub hive_id: Option<String>,
+    /// Hive backends only: see [`DiscoveredEndpoint::paths`].
+    pub paths: HashMap<String, Vec<Vec<String>>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -51,6 +66,34 @@ struct ModelList {
 #[derive(Debug, Deserialize)]
 struct ModelEntry {
     id: String,
+    /// Set by HivLLM hives: routes behind this model.
+    #[serde(default)]
+    hivllm: Option<HivModelMeta>,
+}
+
+/// `hivllm` extension of a model object in a hive's `/v1/models`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct HivModelMeta {
+    /// Hive-id paths from the advertising hive (excluded) to a real
+    /// backend: `[]` = one of its own backends serves it directly.
+    #[serde(default)]
+    pub paths: Vec<Vec<String>>,
+}
+
+/// Paths through hive member `hive_id` for one advertised model: each
+/// advertised path prefixed with the member itself. Hives that predate
+/// path vectors advertise none, which reads as a single opaque hop.
+/// Over-long paths are dropped.
+pub fn hive_paths(hive_id: &str, meta: Option<&HivModelMeta>) -> Vec<Vec<String>> {
+    let advertised = match meta {
+        Some(m) => m.paths.clone(),
+        None => vec![Vec::new()],
+    };
+    advertised
+        .into_iter()
+        .map(|p| std::iter::once(hive_id.to_string()).chain(p).collect::<Vec<_>>())
+        .filter(|p| p.len() <= MAX_HOPS)
+        .collect()
 }
 
 /// Well-known OpenAI-compatible ports on localhost.
@@ -111,12 +154,19 @@ pub fn join_upstream_path(base_url: &str, api_path: &str) -> String {
     }
 }
 
-/// Probe a single base URL for OpenAI compat. Returns model ids (and the
-/// hive id, for hives) on success.
-pub async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> Option<Probed> {
+/// Probe a single base URL for OpenAI compat. Returns model ids (and, for
+/// hives, their id and per-model paths) on success. `self_id` (the
+/// probing hive) rides along as Via, so a hive answers only with routes
+/// that don't lead back through the prober.
+pub async fn probe_openai_endpoint(
+    client: &reqwest::Client,
+    base_url: &str,
+    self_id: &str,
+) -> Option<Probed> {
     let url = models_url(base_url);
     let resp = client
         .get(&url)
+        .header(VIA_HEADER, self_id)
         .timeout(Duration::from_secs(2))
         .send()
         .await
@@ -130,10 +180,25 @@ pub async fn probe_openai_endpoint(client: &reqwest::Client, base_url: &str) -> 
         .and_then(|v| v.to_str().ok())
         .map(str::to_string);
     let body: ModelList = resp.json().await.ok()?;
-    let mut models: Vec<String> = body.data.into_iter().map(|m| m.id).collect();
+    let mut paths: HashMap<String, Vec<Vec<String>>> = HashMap::new();
+    let mut models = Vec::new();
+    for entry in body.data {
+        if let Some(hid) = &hive_id {
+            let found = hive_paths(hid, entry.hivllm.as_ref());
+            if found.is_empty() {
+                continue; // only over-long routes: not usable
+            }
+            paths.entry(entry.id.clone()).or_default().extend(found);
+        }
+        models.push(entry.id);
+    }
     models.sort();
     models.dedup();
-    Some(Probed { models, hive_id })
+    Some(Probed {
+        models,
+        hive_id,
+        paths,
+    })
 }
 
 /// `ss -tln` listening TCP ports (Linux). Falls back to empty on error.
@@ -246,6 +311,7 @@ pub async fn discover(
     client: &reqwest::Client,
     extra_ports: &[u16],
     exclude_ports: &[u16],
+    self_id: &str,
 ) -> Vec<DiscoveredEndpoint> {
     let mut candidates: Vec<u16> = well_known_ports(extra_ports);
     candidates.extend(ss_listening_ports());
@@ -263,7 +329,7 @@ pub async fn discover(
             let docker_ports = &docker_ports;
             async move {
                 let base_url = format!("http://127.0.0.1:{port}");
-                let probed = probe_openai_endpoint(client, &base_url).await?;
+                let probed = probe_openai_endpoint(client, &base_url, self_id).await?;
                 let source = if docker_ports.contains(&port) {
                     "docker"
                 } else if well_known_ports(&[]).contains(&port) {
@@ -278,6 +344,7 @@ pub async fn discover(
                     models: probed.models,
                     source: source.to_string(),
                     hive_id: probed.hive_id,
+                    paths: probed.paths,
                 })
             }
         })
@@ -318,13 +385,14 @@ fn url_host(base_url: &str) -> String {
 pub async fn probe_static(
     client: &reqwest::Client,
     urls: &[String],
+    self_id: &str,
 ) -> Vec<DiscoveredEndpoint> {
     let probed: Vec<Option<DiscoveredEndpoint>> = stream::iter(urls.iter().cloned())
         .map(|raw| {
             let client = client.clone();
             async move {
                 let base_url = normalize_base_url(&raw);
-                let probed = match probe_openai_endpoint(&client, &base_url).await {
+                let probed = match probe_openai_endpoint(&client, &base_url, self_id).await {
                     Some(p) => p,
                     None => {
                         tracing::warn!(%base_url, "static backend unreachable, skipping");
@@ -346,6 +414,7 @@ pub async fn probe_static(
                     models: probed.models,
                     source: "static".to_string(),
                     hive_id: probed.hive_id,
+                    paths: probed.paths,
                 })
             }
         })
@@ -379,6 +448,14 @@ pub fn merge_endpoints(
                 }
                 if existing.hive_id.is_none() {
                     existing.hive_id = ep.hive_id;
+                }
+                for (model, paths) in ep.paths {
+                    let slot = existing.paths.entry(model).or_default();
+                    for p in paths {
+                        if !slot.contains(&p) {
+                            slot.push(p);
+                        }
+                    }
                 }
             }
             None => {
@@ -432,6 +509,7 @@ mod tests {
                 models: models.iter().map(|s| s.to_string()).collect(),
                 source: source.into(),
                 hive_id: None,
+                paths: HashMap::new(),
             }
         }
         let out = merge_endpoints(
@@ -513,6 +591,7 @@ mod tests {
                 format!("http://127.0.0.1:{port}"),
                 format!("127.0.0.1:{dead}"),
             ],
+            "test-hive",
         )
         .await;
         assert_eq!(found.len(), 1);
@@ -542,10 +621,28 @@ mod tests {
         let found = probe_static(
             &client,
             &[format!("http://127.0.0.1:{port}/general-stage1/v1")],
+            "test-hive",
         )
         .await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].models, vec!["teacher-general-stage1".to_string()]);
         assert_eq!(found[0].source, "static");
+    }
+
+    #[test]
+    fn hive_paths_prefix_the_member_and_drop_long_chains() {
+        let meta = HivModelMeta {
+            paths: vec![vec![], vec!["b".into()]],
+        };
+        assert_eq!(
+            hive_paths("a", Some(&meta)),
+            vec![vec!["a".to_string()], vec!["a".to_string(), "b".to_string()]]
+        );
+        // Pre-path-vector hive: one opaque hop.
+        assert_eq!(hive_paths("a", None), vec![vec!["a".to_string()]]);
+        let long = HivModelMeta {
+            paths: vec![(0..MAX_HOPS).map(|i| format!("h{i}")).collect()],
+        };
+        assert!(hive_paths("a", Some(&long)).is_empty());
     }
 }
