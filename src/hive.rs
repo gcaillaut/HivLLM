@@ -69,6 +69,9 @@ pub struct Hive {
     /// Forward the client's `Authorization` header to backends (opt-in:
     /// by default a token never leaves the hive).
     forward_auth: bool,
+    /// Largest accepted request body (`None` = unlimited). Axum's 2 MB
+    /// default rejects long contexts and base64 images.
+    max_body: Option<usize>,
     /// Last rendered hive view (change detection for stdout logging).
     last_view: Arc<Mutex<String>>,
     endpoints: Arc<RwLock<Vec<DiscoveredEndpoint>>>,
@@ -96,6 +99,7 @@ impl Hive {
             inflight: Arc::new(StdMutex::new(HashMap::new())),
             cooldown: Arc::new(StdMutex::new(HashMap::new())),
             forward_auth: false,
+            max_body: Some(DEFAULT_MAX_BODY),
             last_view: Arc::new(Mutex::new(String::new())),
             endpoints: Arc::new(RwLock::new(Vec::new())),
             rr: Arc::new(Mutex::new(HashMap::new())),
@@ -120,6 +124,11 @@ impl Hive {
     /// a long generation that keeps streaming is never cut off.
     pub fn with_timeouts(mut self, connect: Duration, read: Option<Duration>) -> Self {
         self.client = upstream_client(connect, read);
+        self
+    }
+
+    pub fn with_max_body(mut self, max: Option<usize>) -> Self {
+        self.max_body = max;
         self
     }
 
@@ -675,6 +684,47 @@ fn resolve_model(query: &ModelQuery, body: &Value) -> Option<String> {
     body.get("model")?.as_str().map(|s| s.to_string())
 }
 
+/// Default largest request body: room for long contexts and a few
+/// base64 images.
+pub const DEFAULT_MAX_BODY: usize = 64 * 1024 * 1024;
+
+/// Upstream response headers to hand the client: everything but
+/// hop-by-hop headers (this hop's framing is axum's), `content-length`
+/// (re-computed), the upstream's CORS policy (the hive enforces its own —
+/// a backend's `access-control-allow-origin: *` must not bypass it) and
+/// its hive id (replaced by ours). Upstreams that omit `content-type` get
+/// `text/event-stream` for successful streams, JSON otherwise.
+fn client_headers(resp: &reqwest::Response, sse: bool) -> HeaderMap {
+    const DROP: &[&str] = &[
+        "connection",
+        "keep-alive",
+        "proxy-authenticate",
+        "proxy-authorization",
+        "te",
+        "trailer",
+        "transfer-encoding",
+        "upgrade",
+        "content-length",
+        HIVE_ID_HEADER,
+    ];
+    let mut out = HeaderMap::new();
+    for (name, value) in resp.headers() {
+        let n = name.as_str();
+        if DROP.contains(&n) || n.starts_with("access-control-") {
+            continue;
+        }
+        out.append(name.clone(), value.clone());
+    }
+    let fallback = if sse { "text/event-stream" } else { "application/json" };
+    out.entry(axum::http::header::CONTENT_TYPE)
+        .or_insert(axum::http::HeaderValue::from_static(fallback));
+    if sse {
+        out.entry(axum::http::header::CACHE_CONTROL)
+            .or_insert(axum::http::HeaderValue::from_static("no-cache"));
+    }
+    out
+}
+
 /// Upstream statuses worth another candidate: the backend is rate
 /// limiting (429), broken (500), a bad gateway — e.g. a downstream hive's
 /// `loop detected` — (502), or unavailable / still loading (503). Never
@@ -739,6 +789,10 @@ pub fn valid_hive_id(id: &str) -> bool {
 pub fn routes(hive: Hive) -> axum::Router {
     use axum::routing::{get, post};
     let id = axum::http::HeaderValue::from_str(&hive.own_id).expect("valid hive id");
+    let body_limit = match hive.max_body {
+        Some(max) => axum::extract::DefaultBodyLimit::max(max),
+        None => axum::extract::DefaultBodyLimit::disable(),
+    };
     axum::Router::new()
         .route("/health", get(health))
         .route("/load", get(server_load))
@@ -750,6 +804,7 @@ pub fn routes(hive: Hive) -> axum::Router {
         .route("/api/hive/backends", get(list_backends))
         .route("/api/hive/queries", get(list_queries))
         .with_state(hive)
+        .layer(body_limit)
         .layer(axum::middleware::map_response(move |mut resp: Response| {
             let id = id.clone();
             async move {
@@ -1092,6 +1147,7 @@ async fn proxy_by_model(
             // Tee the SSE bytes: client streams untouched while we rebuild the
             // response for the log. The entry is emitted when the stream ends,
             // so logged latency covers the full generation.
+            let resp_headers = client_headers(&resp, status.is_success());
             let acc = Arc::new(std::sync::Mutex::new(StreamAcc::default()));
             let (tx, rx) = oneshot::channel::<StreamSummary>();
             let body = Body::from_stream(TeeStream::new(resp.bytes_stream(), acc.clone(), tx));
@@ -1126,12 +1182,10 @@ async fn proxy_by_model(
                 .await;
                 drop(inflight);
             });
-            let mut resp_headers = HeaderMap::new();
-            resp_headers.insert("Content-Type", "text/event-stream".parse().unwrap());
-            resp_headers.insert("Cache-Control", "no-cache".parse().unwrap());
             return (status, resp_headers, body).into_response();
         }
 
+        let resp_headers = client_headers(&resp, false);
         // The request was processed: a failed body read is reported, not
         // retried elsewhere (and never passed off as an empty success).
         let bytes = match resp.bytes().await {
@@ -1186,8 +1240,6 @@ async fn proxy_by_model(
         )
         .await;
         drop(inflight);
-        let mut resp_headers = HeaderMap::new();
-        resp_headers.insert("Content-Type", "application/json".parse().unwrap());
         return (status, resp_headers, body_from_bytes(bytes)).into_response();
     }
 
@@ -1736,9 +1788,7 @@ mod tests {
 
     /// Serve `hive` on an ephemeral port with the proxy routes; returns its URL.
     async fn serve_proxy(hive: Hive) -> String {
-        let app = Router::new()
-            .route("/v1/chat/completions", post(chat_completions))
-            .with_state(hive);
+        let app = routes(hive);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
@@ -2104,7 +2154,9 @@ mod tests {
                     Json(serde_json::json!({"id": "ok", "choices": []})).into_response()
                 }
             }),
-        );
+        )
+        // Mocks accept anything: size limits under test are the hive's.
+        .layer(axum::extract::DefaultBodyLimit::disable());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
         tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
@@ -2183,5 +2235,73 @@ mod tests {
         let body: Value = resp.json().await.unwrap();
         assert_eq!(body["error"]["message"], "mock 500");
         assert_eq!((hits(&a_hits), hits(&b_hits)), (1, 1));
+    }
+
+    fn big_chat(bytes: usize) -> Value {
+        serde_json::json!({"model": "m", "messages": [{"role": "user", "content": "x".repeat(bytes)}]})
+    }
+
+    #[tokio::test]
+    async fn large_bodies_pass_and_the_limit_is_configurable() {
+        let (port, backend_hits) = status_backend(200).await;
+        let default = serve_proxy(hive_with(vec![ep("a", port, &["m"])], vec![]).await).await;
+        let small = serve_proxy(
+            hive_with(vec![ep("a", port, &["m"])], vec![])
+                .await
+                .with_max_body(Some(1024 * 1024)),
+        )
+        .await;
+        let c = reqwest::Client::new();
+        let post = |url: &str| c.post(format!("{url}/v1/chat/completions")).json(&big_chat(3 << 20)).send();
+        // 3 MB: over axum's 2 MB default, well under ours.
+        assert_eq!(post(&default).await.unwrap().status(), 200);
+        assert_eq!(post(&small).await.unwrap().status(), 413);
+        assert_eq!(hits(&backend_hits), 1);
+    }
+
+    #[tokio::test]
+    async fn upstream_headers_pass_through_minus_cors_and_hop_by_hop() {
+        // A streaming request answered with a JSON error: the client must
+        // see JSON (not text/event-stream), the upstream's request id, and
+        // neither the upstream's CORS policy nor its hive id.
+        let mock = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    StatusCode::BAD_REQUEST,
+                    [
+                        ("content-type", "application/json"),
+                        ("x-request-id", "req-42"),
+                        ("access-control-allow-origin", "*"),
+                        (HIVE_ID_HEADER, "someone-else"),
+                    ],
+                    r#"{"error":{"message":"context too long"}}"#,
+                )
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        let hive = hive_with(vec![ep("a", port, &["m"])], vec![]).await;
+        let me = hive.own_id();
+        let url = serve_proxy(hive).await;
+        let resp = chat(&url, true).await;
+        assert_eq!(resp.status(), 400);
+        let h = resp.headers();
+        assert_eq!(h["content-type"], "application/json");
+        assert_eq!(h["x-request-id"], "req-42");
+        assert!(h.get("access-control-allow-origin").is_none());
+        assert_eq!(h[HIVE_ID_HEADER], me.as_str());
+        assert_eq!(resp.json::<Value>().await.unwrap()["error"]["message"], "context too long");
+    }
+
+    #[tokio::test]
+    async fn successful_streams_keep_sse_headers() {
+        let (port, _) = status_backend(200).await;
+        let url = serve_proxy(hive_with(vec![ep("a", port, &["m"])], vec![]).await).await;
+        let resp = chat(&url, true).await;
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.headers()["content-type"], "text/event-stream");
+        assert_eq!(resp.headers()["cache-control"], "no-cache");
     }
 }

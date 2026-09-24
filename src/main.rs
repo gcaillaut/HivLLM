@@ -128,6 +128,11 @@ struct Args {
     #[arg(long, default_value_t = 600)]
     read_timeout: u64,
 
+    /// Largest accepted request body in MiB (0 = unlimited). Long
+    /// contexts and base64 images easily exceed a few MB.
+    #[arg(long, default_value_t = 64)]
+    max_body_mb: usize,
+
     /// Require `Authorization: Bearer <key>` on every route but /health.
     /// Prefer the env var: flags are visible in `ps`.
     #[arg(long, env = "HIVLLM_API_KEY", hide_env_values = true, default_value = "")]
@@ -196,7 +201,8 @@ async fn main() -> anyhow::Result<()> {
         .with_logger(logger)
         .with_log_options(args.log_truncate, args.log_max_chars)
         .with_timeouts(Duration::from_secs(args.connect_timeout), read_timeout)
-        .with_forward_auth(args.forward_auth);
+        .with_forward_auth(args.forward_auth)
+        .with_max_body((args.max_body_mb > 0).then(|| args.max_body_mb.saturating_mul(1024 * 1024)));
     let hive = match args.hive_id {
         Some(id) if !hive::valid_hive_id(&id) => {
             return Err(format!("invalid --hive-id {id:?}: printable ASCII, no spaces or commas").into());

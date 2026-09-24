@@ -9,7 +9,6 @@
 use futures::{stream, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use std::process::Command;
 use std::time::Duration;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -201,14 +200,28 @@ pub async fn probe_openai_endpoint(
     })
 }
 
-/// `ss -tln` listening TCP ports (Linux). Falls back to empty on error.
-pub fn ss_listening_ports() -> Vec<u16> {
-    let out = Command::new("ss")
-        .args(["-tln"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
-    parse_ss_ports(&out)
+/// Longest a helper command (`ss`, `docker ps`) may take: a wedged Docker
+/// daemon must not stall discovery.
+const COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Stdout of `program args…`, or empty when it is missing, fails or
+/// outlives `timeout` (then it is killed). Async: never blocks a runtime
+/// worker thread.
+async fn command_output(program: &str, args: &[&str], timeout: Duration) -> String {
+    let child = tokio::process::Command::new(program)
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    match tokio::time::timeout(timeout, child).await {
+        Ok(Ok(out)) if out.status.success() => String::from_utf8_lossy(&out.stdout).into_owned(),
+        Ok(Ok(_)) | Ok(Err(_)) => String::new(),
+        Err(_) => {
+            tracing::warn!(program, ?timeout, "discovery command timed out, skipped");
+            String::new()
+        }
+    }
 }
 
 fn parse_ss_ports(ss_output: &str) -> Vec<u16> {
@@ -232,13 +245,9 @@ fn parse_ss_ports(ss_output: &str) -> Vec<u16> {
     v
 }
 
-/// `ss -tlnp` -> map port -> process name (best effort).
-pub fn ss_port_processes() -> HashMap<u16, String> {
-    let out = Command::new("ss")
-        .args(["-tlnp"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+/// `ss -tlnp` output -> map port -> process name (best effort: names
+/// only show for processes this user may inspect).
+fn parse_ss_processes(out: &str) -> HashMap<u16, String> {
     let mut map = HashMap::new();
     for line in out.lines() {
         // crude: find :PORT then users:(("name",pid=...))
@@ -264,13 +273,8 @@ pub fn ss_port_processes() -> HashMap<u16, String> {
     map
 }
 
-/// `docker ps` published host ports (best effort, empty if docker missing).
-pub fn docker_host_ports() -> Vec<u16> {
-    let out = Command::new("docker")
-        .args(["ps", "--format", "{{.Ports}}"])
-        .output()
-        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
-        .unwrap_or_default();
+/// `docker ps --format {{.Ports}}` output -> published host ports.
+fn parse_docker_ports(out: &str) -> Vec<u16> {
     let mut ports = HashSet::new();
     for line in out.lines() {
         // e.g. "0.0.0.0:8000->8000/tcp, :::8000->8000/tcp" or "127.0.0.1:11434->11434/tcp"
@@ -313,15 +317,21 @@ pub async fn discover(
     exclude_ports: &[u16],
     self_id: &str,
 ) -> Vec<DiscoveredEndpoint> {
+    // One `ss -tlnp` covers both listening ports and process names;
+    // both commands run concurrently, each bounded (missing = empty).
+    let (ss_out, docker_out) = tokio::join!(
+        command_output("ss", &["-tlnp"], COMMAND_TIMEOUT),
+        command_output("docker", &["ps", "--format", "{{.Ports}}"], COMMAND_TIMEOUT),
+    );
+    let docker_ports: HashSet<u16> = parse_docker_ports(&docker_out).into_iter().collect();
+    let proc_map = parse_ss_processes(&ss_out);
+
     let mut candidates: Vec<u16> = well_known_ports(extra_ports);
-    candidates.extend(ss_listening_ports());
-    candidates.extend(docker_host_ports());
+    candidates.extend(parse_ss_ports(&ss_out));
+    candidates.extend(docker_ports.iter().copied());
     candidates.sort_unstable();
     candidates.dedup();
     candidates.retain(|p| !exclude_ports.contains(p));
-
-    let proc_map = ss_port_processes();
-    let docker_ports: HashSet<u16> = docker_host_ports().into_iter().collect();
 
     let results: Vec<Option<DiscoveredEndpoint>> = stream::iter(candidates)
         .map(|port| {
@@ -644,5 +654,33 @@ mod tests {
             paths: vec![(0..MAX_HOPS).map(|i| format!("h{i}")).collect()],
         };
         assert!(hive_paths("a", Some(&long)).is_empty());
+    }
+
+    #[test]
+    fn one_ss_tlnp_call_gives_ports_and_process_names() {
+        let sample = "State Recv-Q Send-Q Local Address:Port Peer Address:Port Process\n\
+LISTEN 0 4096 127.0.0.1:11434 0.0.0.0:* users:((\"ollama\",pid=812,fd=3))\n\
+LISTEN 0 2048 0.0.0.0:8000 0.0.0.0:* users:((\"python3\",pid=99,fd=12))\n\
+LISTEN 0 128 [::]:9090 [::]:*\n";
+        assert_eq!(parse_ss_ports(sample), vec![8000, 9090, 11434]);
+        let procs = parse_ss_processes(sample);
+        assert_eq!(procs.get(&11434).map(String::as_str), Some("ollama"));
+        assert_eq!(procs.get(&8000).map(String::as_str), Some("python3"));
+        assert!(!procs.contains_key(&9090));
+    }
+
+    #[test]
+    fn parses_docker_published_ports() {
+        let out = "0.0.0.0:8000->8000/tcp, :::8000->8000/tcp\n127.0.0.1:11434->11434/tcp\n\n";
+        assert_eq!(parse_docker_ports(out), vec![8000, 11434]);
+    }
+
+    #[tokio::test]
+    async fn slow_or_missing_commands_yield_empty_output() {
+        let start = std::time::Instant::now();
+        assert_eq!(command_output("sleep", &["10"], Duration::from_millis(200)).await, "");
+        assert!(start.elapsed() < Duration::from_secs(2));
+        assert_eq!(command_output("hivllm-no-such-binary", &[], COMMAND_TIMEOUT).await, "");
+        assert_eq!(command_output("echo", &["hi"], COMMAND_TIMEOUT).await, "hi\n");
     }
 }

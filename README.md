@@ -11,6 +11,8 @@ and gathers them behind a **single endpoint**.
    - Scans `ss -tln` listening ports + `docker ps` published ports
      and probes each for `/v1/models`.
    - Re-scans every `--scan-interval` seconds (default 30).
+   - `ss` / `docker ps` run asynchronously with a 5s cap: a missing or
+     wedged Docker daemon never stalls discovery.
 
 2. **Unified hive** (`src/hive.rs`, `src/load.rs`)
    - `GET /v1/models` → aggregated model list from all members.
@@ -64,6 +66,11 @@ and gathers them behind a **single endpoint**.
      one hop per scan. Requests are never forwarded to a member whose only
      routes loop back. Paths are capped at 8 hops, 8 routes per model.
    - Streaming (`"stream": true`) SSE is passed through.
+   - Upstream response headers (`content-type`, request ids, rate-limit
+     headers, …) reach the client, minus hop-by-hop headers and the
+     upstream's CORS headers (the hive's own policy applies).
+   - Request bodies up to `--max-body-mb` (default 64 MiB, 0 = unlimited)
+     are accepted: long contexts and base64 images fit.
 
 3. **Ops**
    - `GET /health`
