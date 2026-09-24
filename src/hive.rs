@@ -21,7 +21,9 @@ use std::{
 };
 use tokio::sync::{oneshot, Mutex, RwLock};
 
-use crate::discovery::{discover, merge_endpoints, probe_static, DiscoveredEndpoint};
+use crate::discovery::{
+    discover, join_upstream_path, merge_endpoints, probe_static, DiscoveredEndpoint,
+};
 use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
 use crate::logging::{
@@ -247,15 +249,24 @@ impl Hive {
         }
     }
 
-    /// Split `http://127.0.0.1:9037` into `("127.0.0.1", Some(9037))`.
-    fn split_host_port(base_url: &str) -> (String, Option<u16>) {
+    /// Split `http://127.0.0.1:9037` into `("127.0.0.1", Some(9037), "")`;
+    /// path-prefixed bases like `http://127.0.0.1:8180/general-stage1/v1`
+    /// yield `("127.0.0.1", Some(8180), "/general-stage1/v1")` so the port
+    /// still parses and the view can tell same-port prefixes apart.
+    fn split_host_port(base_url: &str) -> (String, Option<u16>, String) {
         let no_scheme = base_url.split("://").last().unwrap_or(base_url);
-        match no_scheme.rfind(':') {
+        // Authority is up to the first `/`; the rest is the serving path.
+        let (authority, path) = match no_scheme.find('/') {
+            Some(i) => (&no_scheme[..i], no_scheme[i..].to_string()),
+            None => (no_scheme, String::new()),
+        };
+        match authority.rfind(':') {
             Some(i) => (
-                no_scheme[..i].to_string(),
-                no_scheme[i + 1..].parse().ok(),
+                authority[..i].to_string(),
+                authority[i + 1..].parse().ok(),
+                path,
             ),
-            None => (no_scheme.to_string(), None),
+            None => (authority.to_string(), None, path),
         }
     }
 
@@ -275,10 +286,11 @@ impl Hive {
                     .unwrap_or(Load::Unknown);
                 let flying = inflight.get(&ep.base_url).copied().unwrap_or(0);
                 let (num, exact) = effective_load(server, flying);
-                let (ip, port) = Self::split_host_port(&ep.base_url);
+                let (ip, port, path) = Self::split_host_port(&ep.base_url);
                 models.entry(m.clone()).or_default().push(BackendInfo {
                     ip,
                     port,
+                    path,
                     load: num,
                     exact,
                 });
@@ -346,10 +358,11 @@ impl Hive {
             ));
             for b in &m.backends {
                 let port = b.port.map(|p| p.to_string()).unwrap_or("?".to_string());
+                let where_ = format!("{}:{port}{}", b.ip, b.path);
                 if b.exact {
-                    out.push_str(&format!("\n    {}:{port} load={}", b.ip, b.load));
+                    out.push_str(&format!("\n    {where_} load={}", b.load));
                 } else {
-                    out.push_str(&format!("\n    {}:{port} load=~{}", b.ip, b.load));
+                    out.push_str(&format!("\n    {where_} load=~{}", b.load));
                 }
             }
         }
@@ -447,6 +460,10 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 pub struct BackendInfo {
     pub ip: String,
     pub port: Option<u16>,
+    /// Serving path below host:port (`""` for bare roots,
+    /// `"/general-stage1/v1"` for path-routed backends).
+    #[serde(default)]
+    pub path: String,
     pub load: u64,
     pub exact: bool,
 }
@@ -742,7 +759,7 @@ async fn proxy_by_model(
     // the next one instead of failing the request.
     let mut last_error = String::new();
     for upstream in &candidates {
-        let url = format!("{}{}", upstream.trim_end_matches('/'), upstream_path);
+        let url = join_upstream_path(upstream, upstream_path);
         let mut req = hive
             .client
             .post(&url)

@@ -55,12 +55,52 @@ pub fn well_known_ports(extra: &[u16]) -> Vec<u16> {
     ports
 }
 
+/// Models endpoint for a base URL. Bare server roots probe
+/// `{base}/v1/models`; bases that already carry the OpenAI `/v1` prefix
+/// (e.g. `http://host:8180/general-stage1/v1` behind a path-routing
+/// gateway) probe `{base}/models` instead of doubling to `/v1/v1/models`.
+pub fn models_url(base_url: &str) -> String {
+    let b = base_url.trim_end_matches('/');
+    if b.ends_with("/v1") {
+        format!("{b}/models")
+    } else {
+        format!("{b}/v1/models")
+    }
+}
+
+/// Server root for server-level routes (`/metrics`, `/load`): the base URL
+/// with a trailing OpenAI `/v1` prefix stripped, since those routes live
+/// next to `/v1`, not under it.
+pub fn server_root(base_url: &str) -> String {
+    let b = base_url.trim_end_matches('/');
+    if let Some(stripped) = b.strip_suffix("/v1") {
+        if stripped.is_empty() {
+            b.to_string()
+        } else {
+            stripped.trim_end_matches('/').to_string()
+        }
+    } else {
+        b.to_string()
+    }
+}
+
+/// Join a base URL with an OpenAI API path (`/v1/chat/completions`, …)
+/// without doubling a `/v1` prefix the base already carries.
+pub fn join_upstream_path(base_url: &str, api_path: &str) -> String {
+    let b = base_url.trim_end_matches('/');
+    if b.ends_with("/v1") && api_path.starts_with("/v1") {
+        format!("{b}{}", &api_path[3..])
+    } else {
+        format!("{b}{api_path}")
+    }
+}
+
 /// Probe a single base URL for OpenAI compat. Returns model ids on success.
 pub async fn probe_openai_endpoint(
     client: &reqwest::Client,
     base_url: &str,
 ) -> Option<Vec<String>> {
-    let url = format!("{}/v1/models", base_url.trim_end_matches('/'));
+    let url = models_url(base_url);
     let resp = client
         .get(&url)
         .timeout(Duration::from_secs(2))
@@ -382,6 +422,41 @@ mod tests {
         assert_eq!(local.source, "static");
     }
 
+    #[test]
+    fn v1_suffixed_bases_dont_double_the_prefix() {
+        assert_eq!(
+            models_url("http://127.0.0.1:8180/general-stage1/v1"),
+            "http://127.0.0.1:8180/general-stage1/v1/models"
+        );
+        assert_eq!(
+            models_url("http://127.0.0.1:8180/general-stage1/v1/"),
+            "http://127.0.0.1:8180/general-stage1/v1/models"
+        );
+        assert_eq!(
+            models_url("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000/v1/models"
+        );
+        assert_eq!(
+            server_root("http://127.0.0.1:8180/general-stage1/v1"),
+            "http://127.0.0.1:8180/general-stage1"
+        );
+        assert_eq!(
+            server_root("http://127.0.0.1:8000"),
+            "http://127.0.0.1:8000"
+        );
+        assert_eq!(
+            join_upstream_path(
+                "http://127.0.0.1:8180/general-stage1/v1",
+                "/v1/chat/completions"
+            ),
+            "http://127.0.0.1:8180/general-stage1/v1/chat/completions"
+        );
+        assert_eq!(
+            join_upstream_path("http://127.0.0.1:8000", "/v1/chat/completions"),
+            "http://127.0.0.1:8000/v1/chat/completions"
+        );
+    }
+
     #[tokio::test]
     async fn static_probe_skips_unreachable() {
         // Live mock backend.
@@ -417,6 +492,35 @@ mod tests {
         .await;
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].models, vec!["demo-model".to_string()]);
+        assert_eq!(found[0].source, "static");
+    }
+
+    #[tokio::test]
+    async fn static_probe_supports_v1_prefixed_base() {
+        // Gateway-style backend: OpenAI API lives under a path prefix.
+        let app = axum::Router::new().route(
+            "/general-stage1/v1/models",
+            axum::routing::get(|| async {
+                axum::Json(serde_json::json!({
+                    "object": "list",
+                    "data": [{"id": "teacher-general-stage1", "object": "model"}]
+                }))
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+
+        let client = reqwest::Client::new();
+        let found = probe_static(
+            &client,
+            &[format!("http://127.0.0.1:{port}/general-stage1/v1")],
+        )
+        .await;
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].models, vec!["teacher-general-stage1".to_string()]);
         assert_eq!(found[0].source, "static");
     }
 }

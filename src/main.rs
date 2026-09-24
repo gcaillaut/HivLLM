@@ -58,8 +58,14 @@ struct Args {
 
     /// Static backends discovery can't see: base URLs probed for
     /// `/v1/models` on every rescan (docker service names like
-    /// `http://llamacpp:8080`, remote hosts, …). Comma-separated and/or
-    /// repeatable. Unreachable entries are skipped until they answer.
+    /// `http://llamacpp:8080`, remote hosts, …). A base may already
+    /// include the OpenAI `/v1` prefix when the backend lives under a
+    /// path-routing gateway
+    /// (`http://host:8180/general-stage1/v1` probes
+    /// `.../general-stage1/v1/models` and routes
+    /// `.../general-stage1/v1/chat/completions`).
+    /// Comma-separated and/or repeatable. Unreachable entries are
+    /// skipped until they answer.
     #[arg(long, value_delimiter = ',')]
     static_backends: Vec<String>,
 

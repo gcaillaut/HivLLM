@@ -15,6 +15,7 @@
 //! Probes never exclude a backend: anything but a clear signal is
 //! [`Load::Unknown`], and unknown backends stay fully usable.
 
+use crate::discovery::server_root;
 use crate::logging::BoxFuture;
 use serde_json::Value;
 use std::sync::Arc;
@@ -67,7 +68,7 @@ impl LoadProbe for VllmMetricsProbe {
         _model: &'a str,
     ) -> BoxFuture<'a, Load> {
         Box::pin(async move {
-            let url = format!("{}/metrics", base_url.trim_end_matches('/'));
+            let url = format!("{}/metrics", server_root(base_url));
             let resp = match client
                 .get(&url)
                 .timeout(Duration::from_secs(3))
@@ -150,7 +151,7 @@ impl LoadProbe for HivLoadProbe {
         model: &'a str,
     ) -> BoxFuture<'a, Load> {
         Box::pin(async move {
-            let url = format!("{}/load", base_url.trim_end_matches('/'));
+            let url = format!("{}/load", server_root(base_url));
             let resp = match client
                 .get(&url)
                 .query(&[("model", model)])
@@ -211,7 +212,7 @@ impl LoadProbe for VllmLoadProbe {
         _model: &'a str,
     ) -> BoxFuture<'a, Load> {
         Box::pin(async move {
-            let url = format!("{}/load", base_url.trim_end_matches('/'));
+            let url = format!("{}/load", server_root(base_url));
             let resp = match client
                 .get(&url)
                 .timeout(Duration::from_secs(2))
