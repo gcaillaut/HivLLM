@@ -48,13 +48,14 @@ pub struct Hive {
     logger: RequestLogger,
     log_truncate: Truncate,
     log_max_chars: usize,
-    /// Provider load probes: per-model hive aggregates first, then vLLM
-    /// `/metrics`, then vLLM `/load`.
-    probes: Vec<Arc<dyn LoadProbe>>,
-    /// Probes usable when a backend serves several models: no bare
-    /// `/load` — a marker-less server-level number can't be attributed to
-    /// one model of many (a stale hive global would smear across models).
-    scoped_probes: Vec<Arc<dyn LoadProbe>>,
+    /// Per-model probes for members that are hives (`/load?model=`).
+    hive_probes: Vec<Arc<dyn LoadProbe>>,
+    /// Server-level probes for plain backends, run once per server and
+    /// applied to all its models (a busy box is busy for every model).
+    server_probes: Vec<Arc<dyn LoadProbe>>,
+    /// Appended for single-model servers only: bare vLLM `/load` can't be
+    /// attributed to one model of many.
+    single_model_probes: Vec<Arc<dyn LoadProbe>>,
     /// (endpoint id, model) → last polled load. Rebuilt by every
     /// [`Hive::refresh_load`].
     loads: Arc<RwLock<HashMap<(String, String), Load>>>,
@@ -97,12 +98,9 @@ impl Hive {
             logger: RequestLogger::new(),
             log_truncate: Truncate::None,
             log_max_chars: 2000,
-            probes: vec![
-                Arc::new(HivLoadProbe),
-                Arc::new(VllmMetricsProbe),
-                Arc::new(VllmLoadProbe),
-            ],
-            scoped_probes: vec![Arc::new(HivLoadProbe), Arc::new(VllmMetricsProbe)],
+            hive_probes: vec![Arc::new(HivLoadProbe)],
+            server_probes: vec![Arc::new(VllmMetricsProbe)],
+            single_model_probes: vec![Arc::new(VllmLoadProbe)],
             loads: Arc::new(RwLock::new(HashMap::new())),
             inflight: Arc::new(StdMutex::new(HashMap::new())),
             cooldown: Arc::new(StdMutex::new(HashMap::new())),
@@ -348,45 +346,58 @@ impl Hive {
             .unwrap_or((0, false))
     }
 
-    /// Poll load probes for every (endpoint, model) pair (concurrently)
-    /// and replace the load map. Backends that fail probing stay `Unknown`
-    /// — usable, routed round-robin. Run on a short interval; never
-    /// per-request.
+    /// Poll load probes (concurrently) and replace the load map: once per
+    /// plain server (`/metrics`, then bare `/load` for single-model
+    /// servers), once per model for hive members (only their per-model
+    /// aggregate means anything). Backends that fail probing stay
+    /// `Unknown` — usable, routed round-robin. Run on a short interval;
+    /// never per-request.
     pub async fn refresh_load(&self) {
         let endpoints = self.endpoints.read().await.clone();
-        let mut jobs = Vec::new();
+        // (endpoint id, base_url, probe chain, model to ask about, models the answer covers)
+        type Job = (String, String, Vec<Arc<dyn LoadProbe>>, String, Vec<String>);
+        let mut jobs: Vec<Job> = Vec::new();
         for ep in &endpoints {
-            for m in &ep.models {
-                jobs.push((
-                    ep.id.clone(),
-                    ep.base_url.clone(),
-                    m.clone(),
-                    ep.models.len(),
-                ));
+            if ep.hive_id.is_some() {
+                for m in &ep.models {
+                    let chain = self.hive_probes.clone();
+                    jobs.push((ep.id.clone(), ep.base_url.clone(), chain, m.clone(), vec![m.clone()]));
+                }
+            } else if !ep.models.is_empty() {
+                let mut chain = self.server_probes.clone();
+                if ep.models.len() == 1 {
+                    chain.extend(self.single_model_probes.iter().cloned());
+                }
+                let asked = ep.models[0].clone();
+                jobs.push((ep.id.clone(), ep.base_url.clone(), chain, asked, ep.models.clone()));
             }
         }
-        let probed: HashMap<(String, String), Load> = stream::iter(jobs)
-            .map(|(id, base_url, model, n_models)| {
-                // Multi-model backends skip the bare-`/load` fallback: a
-                // marker-less server-level number is that model's load only
-                // for single-model servers. Box-level `/metrics` still
-                // applies (a shared box is busy for every model on it).
-                let chain = if n_models > 1 {
-                    self.scoped_probes.clone()
-                } else {
-                    self.probes.clone()
-                };
+        let probes: Vec<_> = jobs
+            .into_iter()
+            .map(|(id, base_url, chain, asked, covers)| {
                 let client = self.client.clone();
                 async move {
-                    let load = probe_backend(&chain, &client, &base_url, &model).await;
-                    ((id, model), load)
+                    let load = probe_backend(&chain, &client, &base_url, &asked).await;
+                    (id, covers, load)
                 }
             })
-            .buffer_unordered(32)
-            .collect()
-            .await;
-        let known = probed.values().filter(|l| matches!(l, Load::Known(_))).count();
-        let probe_names: Vec<&str> = self.probes.iter().map(|p| p.name()).collect();
+            .collect();
+        let results: Vec<(String, Vec<String>, Load)> =
+            stream::iter(probes).buffer_unordered(32).collect().await;
+        let mut probed: HashMap<(String, String), Load> = HashMap::new();
+        for (id, covers, load) in results {
+            for m in covers {
+                probed.insert((id.clone(), m), load);
+            }
+        }
+        let known = probed.values().filter(|l| !matches!(l, Load::Unknown)).count();
+        let probe_names: Vec<&str> = self
+            .hive_probes
+            .iter()
+            .chain(&self.server_probes)
+            .chain(&self.single_model_probes)
+            .map(|p| p.name())
+            .collect();
         tracing::debug!(?probe_names, known, total = probed.len(), "hive load refresh");
         *self.loads.write().await = probed;
         self.log_view().await;
@@ -2448,5 +2459,66 @@ mod tests {
         strict.set_endpoints(vec![ep("a", 9001, &["m"])]).await;
         strict.set_endpoints(vec![]).await;
         assert!(strict.snapshot().await.is_empty());
+    }
+
+    /// Mock serving `/metrics` (vLLM gauges) and `/load`, counting hits.
+    async fn counting_load_backend(
+        hits: Arc<StdMutex<Vec<String>>>,
+    ) -> String {
+        let (h1, h2) = (hits.clone(), hits.clone());
+        let mock = Router::new()
+            .route(
+                "/metrics",
+                get(move || {
+                    let h = h1.clone();
+                    async move {
+                        lock(&h).push("metrics".into());
+                        "vllm:num_requests_running{engine=\"0\"} 3.0\n"
+                    }
+                }),
+            )
+            .route(
+                "/load",
+                get(move |Query(q): Query<HashMap<String, String>>| {
+                    let h = h2.clone();
+                    async move {
+                        let model = q.get("model").cloned().unwrap_or_default();
+                        lock(&h).push(format!("load?model={model}"));
+                        Json(serde_json::json!({"server_load": 7, "hivllm": {"exact": true}}))
+                    }
+                }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move { axum::serve(listener, mock).await.unwrap() });
+        url
+    }
+
+    #[tokio::test]
+    async fn load_probes_run_once_per_server_and_per_model_only_for_hives() {
+        let plain_hits = Arc::new(StdMutex::new(Vec::new()));
+        let hive_hits = Arc::new(StdMutex::new(Vec::new()));
+        let plain_url = counting_load_backend(plain_hits.clone()).await;
+        let hive_url = counting_load_backend(hive_hits.clone()).await;
+        let mut plain = ep("plain", 1, &["m1", "m2", "m3"]);
+        plain.base_url = plain_url;
+        let mut peer = ep("peer", 1, &["m1", "m2"]);
+        peer.base_url = hive_url;
+        peer.hive_id = Some("peer-hive".into());
+        let hive = Hive::new(0);
+        *hive.endpoints.write().await = vec![plain, peer];
+        hive.refresh_load().await;
+
+        // Three models, one server: one /metrics call, shared by all.
+        assert_eq!(*lock(&plain_hits), vec!["metrics".to_string()]);
+        // A hive peer: its per-model aggregate only, no /metrics.
+        let mut asked = lock(&hive_hits).clone();
+        asked.sort();
+        assert_eq!(asked, vec!["load?model=m1".to_string(), "load?model=m2".to_string()]);
+        let loads = hive.loads.read().await;
+        for m in ["m1", "m2", "m3"] {
+            assert_eq!(loads[&("plain".to_string(), m.to_string())], Load::Measured(3));
+        }
+        assert_eq!(loads[&("peer".to_string(), "m2".to_string())], Load::Measured(7));
     }
 }

@@ -28,7 +28,10 @@ and gathers them behind a **single endpoint**.
       5s) via provider probes — vLLM `GET /metrics`
       (`num_requests_running` + `num_requests_waiting`, always exported)
       first, `GET /load` as fallback (only truthful with
-      `--enable-server-load-tracking` server-side) — and requests go to
+      `--enable-server-load-tracking` server-side, single-model servers
+      only), once per server whatever its model count; hive members are
+      asked their per-model aggregate (`GET /load?model=`) instead — and
+      requests go to
       the lowest *effective* load: `max(server_load, hive-observed
       in-flight requests)` (requests count as in flight from the moment
       they are sent). Ties round-robin. Unreachable backends, and backends
