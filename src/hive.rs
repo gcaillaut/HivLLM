@@ -84,9 +84,10 @@ pub struct Hive {
     missed_scans: Arc<StdMutex<HashMap<String, u32>>>,
     /// Consecutive missed scans before a member leaves (1 = at once).
     drop_after: u32,
-    /// (model, effective load) -> next index. Equal effective loads rotate
-    /// round-robin. All-idle degrades to plain round-robin.
-    rr: Arc<Mutex<HashMap<(String, RankKey), usize>>>,
+    /// model -> round-robin counter, advanced once per routing decision.
+    /// Every run of equal effective loads rotates by it, so ties take
+    /// turns; all-idle degrades to plain round-robin.
+    rr: Arc<Mutex<HashMap<String, usize>>>,
 }
 
 impl Hive {
@@ -213,6 +214,8 @@ impl Hive {
         let mut all = fresh;
         all.extend(kept);
         all.sort_by(|a, b| a.base_url.cmp(&b.base_url));
+        let served: HashSet<&String> = all.iter().flat_map(|e| &e.models).collect();
+        self.rr.lock().await.retain(|m, _| served.contains(m));
         *current = all;
     }
 
@@ -594,7 +597,13 @@ impl Hive {
         drop(loads);
         drop(endpoints);
         ranked.sort_by_key(|(_, n)| *n); // stable: ties keep discovery order
-        let mut rr = self.rr.lock().await;
+        let turn = {
+            let mut rr = self.rr.lock().await;
+            let counter = rr.entry(model.to_string()).or_insert(0);
+            let turn = *counter;
+            *counter = counter.wrapping_add(1);
+            turn
+        };
         let mut out = Vec::with_capacity(ranked.len());
         // Rotate each run of equal (cooling, effective load) independently.
         let mut i = 0;
@@ -606,10 +615,7 @@ impl Hive {
             }
             let group = &mut ranked[i..j];
             if group.len() > 1 {
-                let counter = rr.entry((model.to_string(), key)).or_insert(0);
-                let rot = *counter % group.len();
-                *counter = counter.wrapping_add(1);
-                group.rotate_left(rot);
+                group.rotate_left(turn % group.len());
             }
             out.extend(group.iter().map(|(u, _)| u.clone()));
             i = j;
@@ -622,9 +628,22 @@ impl Hive {
     /// the Via path, and hive members whose every route for `model` runs
     /// through a visited hive. A request that arrives with nothing left is
     /// a loop — the proxy answers 502 instead of forwarding forever.
+    #[cfg(test)]
     pub async fn candidates_excluding(
         &self,
         model: &str,
+        visited: &HashSet<String>,
+    ) -> Vec<String> {
+        let all = self.candidates(model).await;
+        self.without_visited(model, all, visited).await
+    }
+
+    /// `candidates` (from [`Hive::candidates`]) minus those leading back
+    /// to a visited hive (see [`Hive::candidates_excluding`]).
+    async fn without_visited(
+        &self,
+        model: &str,
+        candidates: Vec<String>,
         visited: &HashSet<String>,
     ) -> Vec<String> {
         let excluded: HashSet<String> = self
@@ -638,11 +657,7 @@ impl Hive {
             })
             .map(|ep| ep.base_url.clone())
             .collect();
-        self.candidates(model)
-            .await
-            .into_iter()
-            .filter(|u| !excluded.contains(u))
-            .collect()
+        candidates.into_iter().filter(|u| !excluded.contains(u)).collect()
     }
 }
 
@@ -931,8 +946,12 @@ struct InflightGuard {
 
 impl Drop for InflightGuard {
     fn drop(&mut self) {
-        if let Some(n) = lock(&self.inflight).get_mut(&self.base_url) {
+        let mut inflight = lock(&self.inflight);
+        if let Some(n) = inflight.get_mut(&self.base_url) {
             *n = n.saturating_sub(1);
+            if *n == 0 {
+                inflight.remove(&self.base_url); // no dead entries piling up
+            }
         }
     }
 }
@@ -1129,11 +1148,15 @@ async fn proxy_by_model(
 
     let via_path = parse_via(&headers);
     let visited: HashSet<String> = via_path.iter().cloned().collect();
-    let candidates = hive.candidates_excluding(&model, &visited).await;
+    // One routing decision (the round-robin turn advances once), then
+    // the loop filter.
+    let all = hive.candidates(&model).await;
+    let served_somewhere = !all.is_empty();
+    let candidates = hive.without_visited(&model, all, &visited).await;
     if candidates.is_empty() {
         // Nothing left to try: either the model is unknown (404), or every
         // backend is already on the Via path — a hive-of-hives loop (502).
-        if !hive.candidates(&model).await.is_empty() {
+        if served_somewhere {
             let msg = format!(
                 "loop detected: every backend for model `{model}` already visited ({})",
                 via_path.join(", ")
@@ -1680,8 +1703,8 @@ mod tests {
     async fn recent_queries_reads_newest_first() {
         use crate::logging::{JsonLinesSink, LogEntry, RequestLogger};
         use chrono::Utc;
-        let path = std::env::temp_dir().join("hivllm-test-recent.jsonl");
-        let _ = std::fs::remove_file(&path);
+        let dir = crate::logging::test_dir("recent");
+        let path = dir.join("q.jsonl");
         let sink = JsonLinesSink::open(path.to_str().unwrap()).await.unwrap();
         let logger = RequestLogger::new().with_sink(std::sync::Arc::new(sink));
         for i in 0..3 {
@@ -1706,7 +1729,7 @@ mod tests {
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0]["model"], "m2");
         assert_eq!(entries[1]["model"], "m1");
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1993,6 +2016,7 @@ mod tests {
         assert_eq!(inflight_of(&hive, port), 1);
         assert_eq!(req.await.unwrap(), 200);
         assert_eq!(inflight_of(&hive, port), 0);
+        assert!(lock(&hive.inflight).is_empty(), "idle backends leave no entry");
     }
 
     #[tokio::test]
@@ -2748,5 +2772,18 @@ Content-Type: audio/wav\r\n\r\nRIFF\x00\xff\r\n--B0--\r\n";
         let one: Value = reqwest::get(format!("{url}/v1/models/m")).await.unwrap().json().await.unwrap();
         assert_eq!(one["max_model_len"], 8192);
         assert_eq!(reqwest::get(format!("{url}/v1/models/nope")).await.unwrap().status(), 404);
+    }
+
+    #[tokio::test]
+    async fn round_robin_state_is_per_model_and_pruned() {
+        let hive = Hive::new(0);
+        hive.set_endpoints(vec![ep("a", 9001, &["m", "old"]), ep("b", 9002, &["m"])]).await;
+        hive.candidates("m").await;
+        hive.candidates("old").await;
+        assert_eq!(hive.rr.lock().await.len(), 2);
+        // "old" is no longer served anywhere: its counter goes.
+        hive.set_endpoints(vec![ep("a", 9001, &["m"]), ep("b", 9002, &["m"])]).await;
+        let rr = hive.rr.lock().await;
+        assert_eq!(rr.keys().collect::<Vec<_>>(), vec!["m"]);
     }
 }

@@ -31,12 +31,13 @@ COPY --from=builder /build/target/release/hivllm /app/hivllm
 RUN chown -R hivllm:hivllm /app
 USER hivllm
 EXPOSE 8335
-# NOTE: fixed port — override with `docker run --no-healthcheck` (or a custom
-# healthcheck) when serving on another --port.
+# Serve on another port with `-e HIVLLM_PORT=…` (same as --port): the
+# healthcheck follows it. /health needs no API key.
+ENV HIVLLM_PORT=8335
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -fsS http://127.0.0.1:8335/health > /dev/null
+    CMD curl -fsS "http://127.0.0.1:${HIVLLM_PORT}/health" > /dev/null
 ENTRYPOINT ["/app/hivllm"]
 # Sane defaults (same as the binary): :8335, 30s rescan, 5s load poll,
 # jsonl query log in WORKDIR. Override by appending flags, e.g.:
-#   docker run --rm --network host hivllm --port 8344 --scan-interval 10
+#   docker run --rm --network host -e HIVLLM_PORT=8344 hivllm --scan-interval 10
 CMD []

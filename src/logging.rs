@@ -931,6 +931,18 @@ fn read_archive(path: &std::path::Path) -> std::io::Result<String> {
     Ok(content)
 }
 
+/// Fresh, unique scratch directory for a test (parallel runs never share).
+#[cfg(test)]
+pub fn test_dir(name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "hivllm-{name}-{}-{}",
+        std::process::id(),
+        Utc::now().timestamp_nanos_opt().unwrap_or_default()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -960,8 +972,8 @@ mod tests {
 
     #[tokio::test]
     async fn jsonl_sink_appends_one_line_per_entry() {
-        let path = std::env::temp_dir().join("hivllm-test-queries.jsonl");
-        let _ = std::fs::remove_file(&path);
+        let dir = test_dir("jsonl");
+        let path = dir.join("q.jsonl");
         let sink = JsonLinesSink::open(path.to_str().unwrap()).await.unwrap();
         let entry = LogEntry {
             ts: Utc::now(),
@@ -983,7 +995,7 @@ mod tests {
         assert_eq!(content.lines().count(), 1);
         let v: Value = serde_json::from_str(content.trim()).unwrap();
         assert_eq!(v["route"], "embeddings");
-        let _ = std::fs::remove_file(&path);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1067,16 +1079,6 @@ mod tests {
         }
     }
 
-    fn scratch_dir(name: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hivllm-{name}-{}-{}",
-            std::process::id(),
-            Utc::now().timestamp_nanos_opt().unwrap_or_default()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
-    }
-
     fn names(dir: &std::path::Path) -> Vec<String> {
         let mut v: Vec<String> = std::fs::read_dir(dir)
             .unwrap()
@@ -1089,7 +1091,7 @@ mod tests {
 
     #[tokio::test]
     async fn rolls_compresses_prunes_and_reads_back_across_archives() {
-        let dir = scratch_dir("roll");
+        let dir = test_dir("roll");
         let live = dir.join("q.jsonl");
         let live_s = live.to_str().unwrap();
         // Every entry (~300 bytes) overflows 300 bytes: one roll per entry.
@@ -1124,7 +1126,7 @@ mod tests {
 
     #[tokio::test]
     async fn rolling_without_compression_keeps_plain_archives() {
-        let dir = scratch_dir("roll-plain");
+        let dir = test_dir("roll-plain");
         let live = dir.join("q.jsonl");
         let rotation = Rotation { max_bytes: 300, keep: 0, compress: false };
         let sink = JsonLinesSink::open_with(live.to_str().unwrap(), rotation).await.unwrap();

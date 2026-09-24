@@ -159,7 +159,8 @@ Notes:
   scanning stays host-side). Process names aren't visible across the container
   boundary, so members show as `port-XXXX` instead.
 - Runs as unprivileged user: stick to ports > 1024. The image carries a
-  `HEALTHCHECK` on `:8335/health` (override it when serving another `--port`).
+  `HEALTHCHECK` on `/health` that follows `HIVLLM_PORT` (default 8335) —
+  set the port with `-e HIVLLM_PORT=…` rather than `--port`.
 - Image is ~110MB (multi-stage `rust:1-bookworm` → `debian:bookworm-slim`).
 
 Then:

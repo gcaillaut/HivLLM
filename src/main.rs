@@ -47,8 +47,9 @@ enum LogFormat {
 #[derive(Parser, Debug)]
 #[command(name = "hivllm", about = "All your models. One sticky hive. 🐝")]
 struct Args {
-    /// Port for the unified hive endpoint (8335 = BEES 🐝)
-    #[arg(long, default_value_t = 8335)]
+    /// Port for the unified hive endpoint (8335 = BEES 🐝). In containers
+    /// prefer HIVLLM_PORT: the image's HEALTHCHECK follows it.
+    #[arg(long, env = "HIVLLM_PORT", default_value_t = 8335)]
     port: u16,
 
     /// Interface to bind (127.0.0.1 keeps the hive local; 0.0.0.0 exposes
@@ -167,7 +168,7 @@ struct Args {
 }
 
 #[tokio::main]
-async fn main() -> anyhow::Result<()> {
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::new(
             std::env::var("RUST_LOG").unwrap_or_else(|_| "hivllm=info,tower_http=info".into()),
@@ -428,10 +429,6 @@ fn cors_layer(spec: &str) -> Option<tower_http::cors::CorsLayer> {
     )
 }
 
-// `anyhow` is used only for main's error type; add it as a tiny dep-free alias.
-mod anyhow {
-    pub type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
-}
 
 #[cfg(test)]
 mod tests {
