@@ -28,7 +28,7 @@ use crate::discovery::{
 use crate::docker::DockerDiscovery;
 use crate::load::{effective_load, probe_backend, HivLoadProbe, Load, LoadProbe, VllmLoadProbe, VllmMetricsProbe};
 use crate::logging::{
-    extract_response, read_recent, truncate_text, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
+    error_chain, extract_response, read_recent, truncate_text, truncate_value, LogEntry, LoggedResponse, RequestLogger, StreamAcc,
     StreamSummary, TeeStream, Truncate,
 };
 
@@ -1271,8 +1271,9 @@ async fn proxy_by_model(
                 r
             }
             Err(e) if e.is_timeout() && !e.is_connect() => {
-                let msg = format!("upstream `{upstream}` timed out: {e}");
-                tracing::warn!(%url, error = %e, "upstream timed out, not retrying elsewhere");
+                let cause = error_chain(&e);
+                let msg = format!("upstream `{upstream}` timed out: {cause}");
+                tracing::warn!(%url, error = %cause, "upstream timed out, not retrying elsewhere");
                 log_query(
                     &hive,
                     route,
@@ -1292,9 +1293,10 @@ async fn proxy_by_model(
                 return json_error(StatusCode::GATEWAY_TIMEOUT, msg);
             }
             Err(e) => {
-                tracing::warn!(%url, error = %e, "upstream failed, trying next hive member");
+                let cause = error_chain(&e);
+                tracing::warn!(%url, error = %cause, "upstream failed, trying next hive member");
                 hive.mark_failed(upstream);
-                last_error = e.to_string();
+                last_error = cause;
                 continue;
             }
         };
@@ -1372,8 +1374,9 @@ async fn proxy_by_model(
                 } else {
                     (StatusCode::BAD_GATEWAY, "failed")
                 };
-                let msg = format!("reading response from `{upstream}` {what}: {e}");
-                tracing::warn!(%url, error = %e, "upstream response body {what}");
+                let cause = error_chain(&e);
+                let msg = format!("reading response from `{upstream}` {what}: {cause}");
+                tracing::warn!(%url, error = %cause, "upstream response body {what}");
                 log_query(
                     &hive,
                     route,

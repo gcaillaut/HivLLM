@@ -67,7 +67,7 @@ impl DockerDiscovery {
         {
             Ok(c) => c,
             Err(e) => {
-                tracing::warn!(error = %e, "docker container list failed");
+                tracing::warn!(error = %crate::logging::error_chain(&e), "docker container list failed");
                 return Vec::new();
             }
         };
@@ -152,7 +152,7 @@ impl DockerDiscovery {
                     Some(Ok(evt)) if is_lifecycle(&evt) => triggered = true,
                     Some(Ok(_)) => {}
                     Some(Err(e)) => {
-                        tracing::warn!(error = %e, "docker events error, reconnecting");
+                        tracing::warn!(error = %crate::logging::error_chain(&e), "docker events error, reconnecting");
                         alive = false;
                     }
                     None => {

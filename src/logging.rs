@@ -29,6 +29,25 @@ use futures::Stream;
 
 pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+/// An error with every underlying cause, `outer: cause: root cause`.
+/// reqwest's own message is only "error sending request for url (…)";
+/// the reason (refused, reset by peer, closed before the answer, too many
+/// open files…) is in its sources. Causes already spelled out by an outer
+/// message are not repeated.
+pub fn error_chain(e: &dyn std::error::Error) -> String {
+    let mut out = e.to_string();
+    let mut cause = e.source();
+    while let Some(c) = cause {
+        let msg = c.to_string();
+        if !msg.is_empty() && !out.contains(&msg) {
+            out.push_str(": ");
+            out.push_str(&msg);
+        }
+        cause = c.source();
+    }
+    out
+}
+
 /// One proxied query (or failed routing attempt).
 #[derive(Debug, Clone, Serialize)]
 pub struct LogEntry {
@@ -536,7 +555,7 @@ impl<S> TeeStream<S> {
 impl<S, E> Stream for TeeStream<S>
 where
     S: Stream<Item = Result<Bytes, E>>,
-    E: std::fmt::Display,
+    E: std::error::Error,
 {
     type Item = Result<Bytes, E>;
 
@@ -560,7 +579,7 @@ where
             }
             Poll::Ready(Some(Err(e))) => {
                 if let Ok(mut acc) = this.acc.lock() {
-                    acc.fail(e.to_string());
+                    acc.fail(error_chain(&e));
                 }
                 Poll::Ready(Some(Err(e)))
             }
@@ -1348,9 +1367,9 @@ mod tests {
     #[tokio::test]
     async fn tee_stream_records_transport_errors() {
         use futures::StreamExt;
-        let chunks: Vec<Result<Bytes, String>> = vec![
+        let chunks: Vec<Result<Bytes, std::io::Error>> = vec![
             Ok(Bytes::from_static(b"data: {\"choices\":[{\"delta\":{\"content\":\"par\"}}]}\n")),
-            Err("connection reset".into()),
+            Err(std::io::Error::other("connection reset")),
         ];
         let acc = Arc::new(std::sync::Mutex::new(StreamAcc::default()));
         let (tx, rx) = oneshot::channel();
@@ -1440,5 +1459,40 @@ mod tests {
         assert!(second.live.lock().await.shared, "second hive on the same log is flagged");
         drop((first, second));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[derive(Debug)]
+    struct Wrapped(&'static str, Option<Box<Wrapped>>);
+    impl std::fmt::Display for Wrapped {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str(self.0)
+        }
+    }
+    impl std::error::Error for Wrapped {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.1.as_deref().map(|w| w as _)
+        }
+    }
+
+    #[test]
+    fn error_chain_lists_causes_once() {
+        let root = Wrapped("Connection reset by peer (os error 104)", None);
+        let mid = Wrapped("tcp error: Connection reset by peer (os error 104)", Some(Box::new(root)));
+        let top = Wrapped("error sending request", Some(Box::new(mid)));
+        assert_eq!(
+            error_chain(&top),
+            "error sending request: tcp error: Connection reset by peer (os error 104)"
+        );
+    }
+
+    #[tokio::test]
+    async fn error_chain_names_the_real_reason_of_reqwest_failures() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        drop(listener); // nothing listens: connection refused
+        let e = reqwest::get(format!("http://127.0.0.1:{port}/v1/models")).await.unwrap_err();
+        let chain = error_chain(&e);
+        assert!(chain.starts_with("error sending request"), "{chain}");
+        assert!(chain.to_lowercase().contains("connection refused"), "{chain}");
     }
 }
