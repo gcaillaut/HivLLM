@@ -693,19 +693,60 @@ pub struct JsonLinesSink {
     live: Mutex<LiveFile>,
 }
 
+/// How long a failed roll waits before the next attempt (appending goes
+/// on meanwhile): without it every write retries and warns.
+const ROLL_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 struct LiveFile {
     file: tokio::fs::File,
     size: u64,
+    /// (device, inode) of the open file: tells whether the path still
+    /// points to it.
+    identity: Option<(u64, u64)>,
+    failed_rolls: u32,
+    retry_roll_at: Option<std::time::Instant>,
+    /// Another process held the file's lock when we opened it.
+    shared: bool,
 }
 
+#[cfg(unix)]
+fn identity(meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    Some((meta.dev(), meta.ino()))
+}
+
+#[cfg(not(unix))]
+fn identity(_meta: &std::fs::Metadata) -> Option<(u64, u64)> {
+    None
+}
+
+/// Open (creating) the live file for appending, holding an advisory lock
+/// on it: a second process appending to the same file (typically another
+/// hive started in the same directory) would roll it under our feet, so
+/// that is reported loudly — logging still goes on.
 async fn open_append(path: &str) -> std::io::Result<LiveFile> {
-    let file = tokio::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .await?;
-    let size = file.metadata().await?.len();
-    Ok(LiveFile { file, size })
+    let path_owned = path.to_string();
+    let std_file = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new().create(true).append(true).open(&path_owned)
+    })
+    .await
+    .map_err(std::io::Error::other)??;
+    let shared = matches!(std_file.try_lock(), Err(std::fs::TryLockError::WouldBlock));
+    if shared {
+        tracing::warn!(
+            file = %path,
+            "another process is writing this query log (a second hive?): give each hive its own log.file, or rolling will fight"
+        );
+    }
+    let meta = std_file.metadata()?;
+    Ok(LiveFile {
+        file: tokio::fs::File::from_std(std_file),
+        size: meta.len(),
+        identity: identity(&meta),
+        failed_rolls: 0,
+        retry_roll_at: None,
+        shared,
+    })
 }
 
 impl JsonLinesSink {
@@ -724,13 +765,49 @@ impl JsonLinesSink {
         })
     }
 
+    /// Make sure `live` is the file at the configured path. If it was
+    /// deleted, moved or replaced (someone's `rm`, logrotate, another
+    /// process rolling it), writing on would land in a file nobody reads
+    /// — or nowhere: reopen a fresh one at the path instead.
+    async fn follow_path(&self, live: &mut LiveFile) {
+        let current = match tokio::fs::metadata(&self.path).await {
+            Ok(meta) => identity(&meta),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return, // can't tell: keep going
+        };
+        let gone = match (current, live.identity) {
+            (None, _) => true,
+            (Some(now), Some(ours)) => now != ours,
+            (Some(_), None) => false, // no inode numbers on this platform
+        };
+        if !gone {
+            return;
+        }
+        tracing::warn!(
+            file = %self.path,
+            "query log file was deleted, moved or replaced by someone else; logging to a fresh file at its path"
+        );
+        match open_append(&self.path).await {
+            Ok(fresh) => *live = fresh,
+            Err(e) => tracing::warn!(error = %e, file = %self.path, "cannot reopen the query log"),
+        }
+    }
+
     /// Move the live file to a fresh archive and reopen it empty.
     /// Compression and pruning run off the logging path.
     async fn roll(&self, live: &mut LiveFile) -> std::io::Result<()> {
         use tokio::io::AsyncWriteExt;
         live.file.flush().await?;
         let archive = ArchiveName::new(&self.path).fresh_path();
-        tokio::fs::rename(&self.path, &archive).await?;
+        match tokio::fs::rename(&self.path, &archive).await {
+            Ok(()) => {}
+            // Vanished since `follow_path` looked: nothing left to roll.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                *live = open_append(&self.path).await?;
+                return Ok(());
+            }
+            Err(e) => return Err(e),
+        }
         *live = open_append(&self.path).await?;
         let (path, rotation) = (self.path.clone(), self.rotation);
         tokio::task::spawn_blocking(move || {
@@ -762,10 +839,20 @@ impl LogSink for JsonLinesSink {
             let mut line = serde_json::to_vec(&entry).unwrap_or_default();
             line.push(b'\n');
             let mut live = self.live.lock().await;
+            self.follow_path(&mut live).await;
             let max = self.rotation.max_bytes;
-            if max > 0 && live.size > 0 && live.size + line.len() as u64 > max {
+            let backing_off = live.retry_roll_at.is_some_and(|t| std::time::Instant::now() < t);
+            if max > 0 && !backing_off && live.size > 0 && live.size + line.len() as u64 > max {
                 if let Err(e) = self.roll(&mut live).await {
-                    tracing::warn!(error = %e, "query log rolling failed, still appending");
+                    live.failed_rolls += 1;
+                    live.retry_roll_at = Some(std::time::Instant::now() + ROLL_RETRY);
+                    tracing::warn!(
+                        error = %e,
+                        file = %self.path,
+                        retry_in_s = ROLL_RETRY.as_secs(),
+                        shared_with_another_writer = live.shared,
+                        "query log rolling failed, still appending"
+                    );
                 }
             }
             // tokio's File buffers writes in a background task: without the
@@ -1273,5 +1360,85 @@ mod tests {
         let s = rx.await.unwrap();
         assert_eq!(s.response.content.as_deref(), Some("par"));
         assert_eq!(s.error.as_deref(), Some("connection reset"));
+    }
+
+    fn lines_in(path: &std::path::Path) -> Vec<String> {
+        std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .lines()
+            .map(|l| serde_json::from_str::<Value>(l).unwrap()["model"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn deleted_live_file_is_recreated_not_written_into_the_void() {
+        let dir = test_dir("vanished");
+        let live = dir.join("q.jsonl");
+        let rotation = Rotation { max_bytes: 300, keep: 0, compress: false };
+        let sink = JsonLinesSink::open_with(live.to_str().unwrap(), rotation).await.unwrap();
+        sink.emit(entry("before")).await;
+        std::fs::remove_file(&live).unwrap(); // `rm` or a cleanup script
+        sink.emit(entry("after-1")).await;
+        sink.emit(entry("after-2")).await;
+        // Nothing lost after the deletion: a fresh live file (plus the
+        // archive of it rolled when it filled up) holds both entries.
+        let mut all: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .flatten()
+            .flat_map(|e| lines_in(&e.path()))
+            .collect();
+        all.sort();
+        assert_eq!(all, vec!["after-1".to_string(), "after-2".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn file_moved_away_by_another_writer_is_followed() {
+        // Another process (a second hive on the same file, logrotate, …)
+        // renamed the live file: keep logging at the configured path.
+        let dir = test_dir("moved");
+        let live = dir.join("q.jsonl");
+        let rotation = Rotation { max_bytes: 0, keep: 0, compress: false };
+        let sink = JsonLinesSink::open_with(live.to_str().unwrap(), rotation).await.unwrap();
+        sink.emit(entry("old")).await;
+        std::fs::rename(&live, dir.join("elsewhere.jsonl")).unwrap();
+        sink.emit(entry("new")).await;
+        assert_eq!(lines_in(&live), vec!["new".to_string()]);
+        assert_eq!(lines_in(&dir.join("elsewhere.jsonl")), vec!["old".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn failed_rolls_back_off_instead_of_retrying_every_write() {
+        let dir = test_dir("backoff");
+        let live = dir.join("q.jsonl");
+        let rotation = Rotation { max_bytes: 300, keep: 0, compress: false };
+        let sink = JsonLinesSink::open_with(live.to_str().unwrap(), rotation).await.unwrap();
+        sink.emit(entry("a")).await;
+        // Renames into a read-only directory fail (EACCES), appends don't.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        for m in ["b", "c", "d"] {
+            sink.emit(entry(m)).await;
+        }
+        let attempts = sink.live.lock().await.failed_rolls;
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(attempts, 1, "one failed attempt, then a pause");
+        assert_eq!(lines_in(&live), vec!["a", "b", "c", "d"], "entries still appended");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_second_writer_on_the_same_file_is_detected() {
+        let dir = test_dir("shared");
+        let live = dir.join("q.jsonl");
+        let path = live.to_str().unwrap();
+        let never = Rotation { max_bytes: 0, keep: 0, compress: false };
+        let first = JsonLinesSink::open_with(path, never).await.unwrap();
+        let second = JsonLinesSink::open_with(path, never).await.unwrap();
+        assert!(!first.live.lock().await.shared);
+        assert!(second.live.lock().await.shared, "second hive on the same log is flagged");
+        drop((first, second));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
