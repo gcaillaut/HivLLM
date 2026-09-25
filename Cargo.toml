@@ -2,6 +2,8 @@
 name = "hivllm"
 version = "0.1.0"
 edition = "2021"
+# File::try_lock (query-log lock) is stable since 1.89; dependencies need 1.88.
+rust-version = "1.89"
 description = "All your models. One sticky hive. 🐝 — auto-discover local OpenAI endpoints and serve them as one."
 license = "MIT"
 
